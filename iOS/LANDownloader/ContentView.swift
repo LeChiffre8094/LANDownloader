@@ -279,11 +279,47 @@ struct DownloadsView: View {
                 .overlay { if shown.isEmpty { Text(completed ? "暂无已完成文件" : "暂无下载任务").foregroundStyle(.secondary) } }
             }.background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("局域网文件传输").navigationBarTitleDisplayMode(.inline)
-            .sheet(item: $preview) { QuickLookView(url: $0.url) }
+            .sheet(item: $preview) { item in
+                FilePreviewSheet(url: item.url) { preview = nil }
+            }
         }
     }
     private func status(_ status: String) -> String {
         ["downloading": "下载中 · 可锁屏继续", "completed": "已完成", "failed": "下载失败", "interrupted": "已中断", "paused": "已暂停", "pausing": "正在暂停…", "cancelling": "正在取消…", "cancelled": "已取消"][status] ?? status
+    }
+}
+
+// Keep the close control outside Quick Look so video controls cannot hide it.
+struct FilePreviewSheet: View {
+    let url: URL
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Button(action: onClose) {
+                    Label("返回", systemImage: "chevron.left")
+                        .font(.body.weight(.medium))
+                        .frame(minWidth: 60, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.blue)
+                .accessibilityLabel("返回文件列表")
+                Text(url.lastPathComponent)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+            .background(Color(uiColor: .systemBackground))
+            Divider()
+            QuickLookView(url: url)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color(uiColor: .systemBackground))
     }
 }
 
