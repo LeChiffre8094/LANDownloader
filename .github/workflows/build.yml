@@ -3,25 +3,49 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+  pull_request:
+permissions:
+  contents: read
 jobs:
   ios:
     runs-on: macos-15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project
         run: xcodegen generate
+      - name: Select available iPhone simulator
+        run: |
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for items in d["devices"].values() for x in items if x["isAvailable"] and x["name"].startswith("iPhone")))')
+          echo "SIMULATOR_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+      - name: Run parser and file integrity tests
+        run: |
+          xcodebuild -project LANDownloader.xcodeproj -scheme LANDownloader -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" -derivedDataPath build-tests -resultBundlePath TestResults.xcresult CODE_SIGNING_ALLOWED=NO test
       - name: Compile without signing
         run: |
           xcodebuild -project LANDownloader.xcodeproj -scheme LANDownloader -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Verify release metadata
+        run: |
+          APP=build/Build/Products/Release-iphoneos/LANDownloader.app
+          /usr/libexec/PlistBuddy -c 'Print :UILaunchScreen' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APP/Info.plist"
+          test -f "$APP/Assets.car"
       - name: Package unsigned IPA
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/LANDownloader.app Payload/
-          zip -qry LANDownloader-unsigned.ipa Payload
+          zip -qry LANDownloader-v0.2-unsigned.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
-          name: LANDownloader-unsigned-IPA
-          path: LANDownloader-unsigned.ipa
+          name: LANDownloader-v0.2-unsigned-IPA
+          path: LANDownloader-v0.2-unsigned.ipa
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: LANDownloader-test-results
+          path: TestResults.xcresult
+          if-no-files-found: ignore
           retention-days: 14
