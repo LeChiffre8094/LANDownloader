@@ -1,0 +1,27 @@
+name: Build unsigned iOS IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Compile without signing
+        run: |
+          xcodebuild -project LANDownloader.xcodeproj -scheme LANDownloader -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/LANDownloader.app Payload/
+          zip -qry LANDownloader-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LANDownloader-unsigned-IPA
+          path: LANDownloader-unsigned.ipa
+          retention-days: 14
