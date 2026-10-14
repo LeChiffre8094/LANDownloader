@@ -35,6 +35,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "8804DB62695343805A483AEB";
 		};
+		"8D5DB4EB1F848B29ADB180D7" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "FloatingVideoPlayer.swift";
+			"sourceTree" = "<group>";
+		};
+		"A7C465152EF3C55D6297CB88" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "8D5DB4EB1F848B29ADB180D7";
+		};
 		"9B45811DEF92F56BF40158FF" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "sourcecode.swift";
@@ -77,6 +87,7 @@
 				"9727B9EED8ACD2EE46E136A0",
 				"8E11144C93CC318057A18139",
 				"8804DB62695343805A483AEB",
+				"8D5DB4EB1F848B29ADB180D7",
 				"9B45811DEF92F56BF40158FF",
 				"8BF4A28E43F6CF370D3EE1C2",
 				"59BD0A3FF43B32849B319E64",
@@ -152,6 +163,40 @@
 			"isa" = "PBXBuildFile";
 			"productRef" = "0A2192CDA9AB184B8D12D4D9";
 		};
+		"3DD6709E25E8BA7B223D7048" = {
+			"isa" = "XCRemoteSwiftPackageReference";
+			"repositoryURL" = "https://github.com/kingslay/KSPlayer.git";
+			"requirement" = {
+				"kind" = "exactVersion";
+				"version" = "2.3.4";
+			};
+		};
+		"F79F0962C8FAF6D28B13E364" = {
+			"isa" = "XCSwiftPackageProductDependency";
+			"package" = "3DD6709E25E8BA7B223D7048";
+			"productName" = "KSPlayer";
+		};
+		"CDE4AFC57EB6DCF726D6D7E0" = {
+			"isa" = "PBXBuildFile";
+			"productRef" = "F79F0962C8FAF6D28B13E364";
+		};
+		"54DA3BF5E139873C99686ADE" = {
+			"isa" = "XCRemoteSwiftPackageReference";
+			"repositoryURL" = "https://github.com/kingslay/FFmpegKit.git";
+			"requirement" = {
+				"kind" = "exactVersion";
+				"version" = "6.1.3";
+			};
+		};
+		"E107B7970A9F412316815838" = {
+			"isa" = "XCSwiftPackageProductDependency";
+			"package" = "54DA3BF5E139873C99686ADE";
+			"productName" = "FFmpegKit";
+		};
+		"1B7CC844AE9DCD0669263A11" = {
+			"isa" = "PBXBuildFile";
+			"productRef" = "E107B7970A9F412316815838";
+		};
 		"E9B2E96ABC5F6856F2BE79CF" = {
 			"isa" = "XCBuildConfiguration";
 			"buildSettings" = {
@@ -215,6 +260,7 @@
 				"B4A081ADAD6BFF6324356F4F",
 				"022F5CB2516F441224571762",
 				"07916E062B9FFCE92F7DB212",
+				"A7C465152EF3C55D6297CB88",
 				"940C854D54FAA34C16E913A6",
 				"E22D430D1ABEAD104B65960F",
 			);
@@ -225,6 +271,8 @@
 			"buildActionMask" = 2147483647;
 			"files" = (
 				"E83589B33C901A3BD79AB087",
+				"CDE4AFC57EB6DCF726D6D7E0",
+				"1B7CC844AE9DCD0669263A11",
 			);
 			"runOnlyForDeploymentPostprocessing" = 0;
 		};
@@ -251,6 +299,8 @@
 			"name" = "LANDownloader";
 			"packageProductDependencies" = (
 				"0A2192CDA9AB184B8D12D4D9",
+				"F79F0962C8FAF6D28B13E364",
+				"E107B7970A9F412316815838",
 			);
 			"productName" = "LANDownloader";
 			"productReference" = "38A007151ABE87CC01A5B6E9";
@@ -438,6 +488,8 @@
 			"mainGroup" = "B28B7AF69320201D1CF206EB";
 			"packageReferences" = (
 				"F1259B7F9E78F3A12FDE27B3",
+				"3DD6709E25E8BA7B223D7048",
+				"54DA3BF5E139873C99686ADE",
 			);
 			"productRefGroup" = "FBDC4F23F93125BBEEAE800C";
 			"projectDirPath" = "";

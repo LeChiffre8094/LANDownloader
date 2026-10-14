@@ -1,5 +1,6 @@
 import SwiftUI
 import QuickLook
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var manager = DownloadManager.shared
@@ -226,11 +227,42 @@ struct FileBadge: View {
     }
 }
 
-struct PreviewFile: Identifiable { let url: URL; var id: String { url.absoluteString } }
+enum CompletedFileAction: String, CaseIterable, Identifiable {
+    case share = "分享", rename = "重命名", move = "移动", copy = "复制", deleteFile = "删除文件", deleteRecord = "删除记录"
+    var id: String { rawValue }
+    var destructive: Bool { self == .deleteFile || self == .deleteRecord }
+    var symbol: String {
+        switch self {
+        case .share: return "square.and.arrow.up"
+        case .rename: return "pencil"
+        case .move: return "folder"
+        case .copy: return "doc.on.doc"
+        case .deleteFile: return "trash"
+        case .deleteRecord: return "list.bullet.rectangle"
+        }
+    }
+}
+private struct FilePanel: Identifiable {
+    enum Kind { case menu, preview, share, move, copy }
+    let id = UUID()
+    let kind: Kind
+    let record: DownloadRecord
+    var access: LocalFileAccess? = nil
+}
+private struct PendingFileAction {
+    let record: DownloadRecord
+    let action: CompletedFileAction
+}
+
 struct DownloadsView: View {
     @ObservedObject var manager: DownloadManager
+    @State private var video: FloatingVideoSession?
     @State private var completed = false
-    @State private var preview: PreviewFile?
+    @State private var panel: FilePanel?
+    @State private var pendingAction: PendingFileAction?
+    @State private var renaming: DownloadRecord?
+    @State private var newName = ""
+    @State private var deletion: PendingFileAction?
     private var shown: [DownloadRecord] { Array(manager.records.filter { ($0.status == "completed") == completed }.reversed()) }
     var body: some View {
         NavigationStack {
@@ -240,52 +272,193 @@ struct DownloadsView: View {
                     Text("已完成 (\(manager.records.filter { $0.status == "completed" }.count))").tag(true)
                 }.pickerStyle(.segmented).padding(.horizontal)
                 List(shown) { record in
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack(alignment: .top, spacing: 12) {
-                            FileBadge(name: record.name)
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(record.name).font(.subheadline.weight(.medium)).lineLimit(2)
-                                Text("\(sizeString(record.bytes)) / \(sizeString(record.size))").font(.caption).foregroundStyle(.secondary)
-                                if record.size > 0 { ProgressView(value: record.progress).tint(record.status == "completed" ? .green : .blue) }
-                                else if record.status == "downloading" { ProgressView() }
-                                Text(status(record.status)).font(.caption).foregroundStyle(record.status == "completed" ? .green : .secondary)
-                            }
-                            if record.status == "downloading" {
-                                Button { manager.pause(record) } label: { Image(systemName: "pause.circle.fill").font(.title2) }.buttonStyle(.borderless).accessibilityLabel("暂停下载")
-                            } else if record.status == "paused" {
-                                Button { manager.retry(record) } label: { Image(systemName: "play.circle.fill").font(.title2) }.buttonStyle(.borderless).accessibilityLabel("继续下载")
-                            }
-                        }
-                        Text(URL(string: record.url)?.host ?? record.url).font(.caption2).foregroundStyle(.secondary)
-                        if let error = record.error { Text(error).font(.caption).foregroundStyle(.red) }
-                        HStack {
-                            if ["failed", "interrupted", "cancelled"].contains(record.status) { Button("重试") { manager.retry(record) }.buttonStyle(.bordered) }
-                            if record.status == "completed" {
-                                Button("打开") {
-                                    if let url = manager.localURL(record) { preview = PreviewFile(url: url) }
-                                    else { manager.notice = "文件已被移动或删除，请在文件 App 中检查。" }
-                                }.buttonStyle(.bordered)
-                                if let url = manager.localURL(record) { ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }.buttonStyle(.bordered) }
-                            }
-                            Spacer()
-                            Menu {
-                                if ["downloading", "paused"].contains(record.status) { Button("取消下载", role: .destructive) { manager.cancel(record) } }
-                                if ["paused", "failed", "interrupted", "cancelled"].contains(record.status) { Button("从头下载") { manager.retry(record, fromBeginning: true) } }
-                                if !["downloading", "pausing", "cancelling"].contains(record.status) { Button("移除记录（保留文件）") { manager.remove(record) } }
-                            } label: { Image(systemName: "ellipsis").padding(8) }.disabled(["pausing", "cancelling"].contains(record.status))
-                        }.font(.caption)
-                    }.padding(.vertical, 8)
+                    if record.status == "completed" { completedRow(record) }
+                    else { taskRow(record) }
                 }.listStyle(.insetGrouped)
                 .overlay { if shown.isEmpty { Text(completed ? "暂无已完成文件" : "暂无下载任务").foregroundStyle(.secondary) } }
             }.background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("局域网文件传输").navigationBarTitleDisplayMode(.inline)
-            .sheet(item: $preview) { item in
-                FilePreviewSheet(url: item.url) { preview = nil }
+            .overlay(alignment: .top) {
+                if let video {
+                    FloatingVideoPlayer(session: video) { self.video = nil }
+                }
+            }
+            .onDisappear { video?.close(); video = nil }
+            .sheet(item: $panel, onDismiss: performPendingAction) { item in
+                switch item.kind {
+                case .menu:
+                    CompletedFileMenu(name: item.record.name) { action in
+                        pendingAction = PendingFileAction(record: item.record, action: action)
+                        panel = nil
+                    } onCancel: { panel = nil }
+                    .presentationDetents([.height(540), .large])
+                    .presentationDragIndicator(.visible)
+                case .preview:
+                    if let access = item.access { FilePreviewSheet(url: access.url) { panel = nil } }
+                case .share:
+                    if let access = item.access { FileShareView(access: access) }
+                case .move, .copy:
+                    DestinationFolderPicker { folder in
+                        if let folder { manager.transferFile(item.record, to: folder, moving: item.kind == .move) }
+                        panel = nil
+                    }
+                }
+            }
+            .alert("重命名", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+                TextField("文件名（含扩展名）", text: $newName).textInputAutocapitalization(.never).autocorrectionDisabled()
+                Button("取消", role: .cancel) { renaming = nil }
+                Button("保存") { if let record = renaming { manager.renameFile(record, to: newName) }; renaming = nil }
+            } message: { Text("请保留正确的扩展名；重名时不会覆盖已有文件。") }
+            .alert(deletion?.action == .deleteFile ? "删除文件？" : "删除记录？", isPresented: Binding(get: { deletion != nil }, set: { if !$0 { deletion = nil } })) {
+                Button("取消", role: .cancel) { deletion = nil }
+                Button("删除", role: .destructive) {
+                    if let request = deletion {
+                        if request.action == .deleteFile { manager.deleteFile(request.record) }
+                        else { manager.remove(request.record) }
+                    }
+                    deletion = nil
+                }
+            } message: {
+                Text(deletion?.action == .deleteFile ? "将删除实际文件及这条下载记录。此操作无法在 App 内撤销。" : "仅删除这条下载记录，实际文件保留，可在文件 App 中找到。")
             }
         }
     }
+    private func completedRow(_ record: DownloadRecord) -> some View {
+        HStack(spacing: 8) {
+            Button { open(record, kind: .preview) } label: {
+                HStack(spacing: 12) {
+                    FileBadge(name: record.name)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(record.name).font(.subheadline.weight(.medium)).foregroundStyle(.primary).lineLimit(2)
+                        Text(sizeString(record.size)).font(.caption).foregroundStyle(.secondary)
+                        if let error = record.error { Text(error).font(.caption).foregroundStyle(.secondary) }
+                    }
+                    Spacer(minLength: 0)
+                }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }.buttonStyle(.plain).accessibilityHint("预览文件")
+            Button { video?.close(); video = nil; panel = FilePanel(kind: .menu, record: record) } label: {
+                Image(systemName: "ellipsis").font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(.blue).frame(width: 48, height: 48)
+                    .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    .contentShape(Rectangle())
+            }.buttonStyle(.borderless).accessibilityLabel("更多操作：\(record.name)")
+            if manager.fileOperationID == record.id { ProgressView().accessibilityLabel("正在处理文件") }
+        }.padding(.vertical, 8).disabled(manager.fileOperationID != nil)
+    }
+    private func taskRow(_ record: DownloadRecord) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                FileBadge(name: record.name)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(record.name).font(.subheadline.weight(.medium)).lineLimit(2)
+                    Text("\(sizeString(record.bytes)) / \(sizeString(record.size))").font(.caption).foregroundStyle(.secondary)
+                    if record.size > 0 { ProgressView(value: record.progress).tint(.blue) }
+                    else if record.status == "downloading" { ProgressView() }
+                    Text(status(record.status)).font(.caption).foregroundStyle(.secondary)
+                }
+                if record.status == "downloading" {
+                    Button { manager.pause(record) } label: { Image(systemName: "pause.circle.fill").font(.title2) }.buttonStyle(.borderless).accessibilityLabel("暂停下载")
+                } else if record.status == "paused" {
+                    Button { manager.retry(record) } label: { Image(systemName: "play.circle.fill").font(.title2) }.buttonStyle(.borderless).accessibilityLabel("继续下载")
+                }
+            }
+            if let error = record.error { Text(error).font(.caption).foregroundStyle(.red) }
+            HStack {
+                if ["failed", "interrupted", "cancelled"].contains(record.status) { Button("重试") { manager.retry(record) }.buttonStyle(.bordered) }
+                Spacer()
+                Menu {
+                    if ["downloading", "paused"].contains(record.status) { Button("取消下载", role: .destructive) { manager.cancel(record) } }
+                    if ["paused", "failed", "interrupted", "cancelled"].contains(record.status) { Button("从头下载") { manager.retry(record, fromBeginning: true) } }
+                    if !["downloading", "pausing", "cancelling"].contains(record.status) { Button("删除记录", role: .destructive) { manager.remove(record) } }
+                } label: { Image(systemName: "ellipsis").font(.title3).frame(width: 48, height: 48) }
+                .disabled(["pausing", "cancelling"].contains(record.status))
+            }.font(.caption)
+        }.padding(.vertical, 8)
+    }
+    private func open(_ record: DownloadRecord, kind: FilePanel.Kind) {
+        do {
+            let access = try manager.accessibleFile(record)
+            if kind == .preview && FileCategory.classify(access.url.lastPathComponent) == .video {
+                video?.close()
+                video = FloatingVideoSession(access: access)
+            } else {
+                video?.close(); video = nil
+                panel = FilePanel(kind: kind, record: record, access: access)
+            }
+        }
+        catch { manager.notice = error.localizedDescription }
+    }
+    private func performPendingAction() {
+        guard let request = pendingAction else { return }
+        pendingAction = nil
+        switch request.action {
+        case .share: open(request.record, kind: .share)
+        case .move: open(request.record, kind: .move)
+        case .copy: open(request.record, kind: .copy)
+        case .rename:
+            newName = request.record.localName ?? request.record.name
+            renaming = request.record
+        case .deleteFile, .deleteRecord: deletion = request
+        }
+    }
     private func status(_ status: String) -> String {
-        ["downloading": "下载中 · 可锁屏继续", "completed": "已完成", "failed": "下载失败", "interrupted": "已中断", "paused": "已暂停", "pausing": "正在暂停…", "cancelling": "正在取消…", "cancelled": "已取消"][status] ?? status
+        ["downloading": "下载中 · 可锁屏继续", "failed": "下载失败", "interrupted": "已中断", "paused": "已暂停", "pausing": "正在暂停…", "cancelling": "正在取消…", "cancelled": "已取消"][status] ?? status
+    }
+}
+
+struct CompletedFileMenu: View {
+    let name: String
+    let onAction: (CompletedFileAction) -> Void
+    let onCancel: () -> Void
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                Text(name).font(.subheadline).foregroundStyle(.secondary).lineLimit(2).padding(.top, 20)
+                VStack(spacing: 0) {
+                    ForEach(CompletedFileAction.allCases) { action in
+                        Button { onAction(action) } label: {
+                            HStack {
+                                Text(action.rawValue)
+                                Spacer()
+                                Image(systemName: action.symbol)
+                            }.font(.body).foregroundStyle(action.destructive ? Color.red : Color.primary)
+                                .padding(.horizontal, 20).frame(minHeight: 52).contentShape(Rectangle())
+                        }.buttonStyle(.plain)
+                        if action != .deleteRecord { Divider().padding(.leading, 20) }
+                    }
+                }.background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+                Button(action: onCancel) {
+                    Text("取消").font(.body.weight(.semibold)).foregroundStyle(.blue)
+                        .frame(maxWidth: .infinity, minHeight: 52).contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+            }.padding(.horizontal, 16).padding(.bottom, 16)
+        }.background(Color(uiColor: .systemGroupedBackground))
+    }
+}
+
+struct FileShareView: UIViewControllerRepresentable {
+    let access: LocalFileAccess
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [access.url], applicationActivities: nil)
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+struct DestinationFolderPicker: UIViewControllerRepresentable {
+    let onFinish: (URL?) -> Void
+    func makeCoordinator() -> Coordinator { Coordinator(onFinish: onFinish) }
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let controller = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+        controller.allowsMultipleSelection = false
+        controller.delegate = context.coordinator
+        return controller
+    }
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onFinish: (URL?) -> Void
+        init(onFinish: @escaping (URL?) -> Void) { self.onFinish = onFinish }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { onFinish(urls.first) }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onFinish(nil) }
     }
 }
 

@@ -9,6 +9,8 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     @Published private(set) var records: [DownloadRecord] = []
     @Published private(set) var restoring = true
     @Published var notice: String?
+    @Published private(set) var fileOperationID: String?
+    private let fileQueue = DispatchQueue(label: "LANDownloader.fileOperations", qos: .userInitiated)
     private var session: URLSession!
     private var backgroundCompletion: (() -> Void)?
     private let storeQueue = DispatchQueue(label: "LANDownloader.store")
@@ -190,16 +192,94 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         persist()
     }
     func remove(_ record: DownloadRecord) {
+        guard fileOperationID != record.id else { return }
         guard !["downloading", "pausing", "cancelling"].contains(record.status) else { return }
         tasks.removeValue(forKey: record.id)?.cancel()
         records.removeAll { $0.id == record.id }
         try? FileManager.default.removeItem(at: resumeURL(record.id))
         persist()
     }
-    func localURL(_ record: DownloadRecord) -> URL? {
-        guard let name = record.localName, name == (name as NSString).lastPathComponent else { return nil }
-        let url = documentURL.appendingPathComponent(name)
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    func accessibleFile(_ record: DownloadRecord) throws -> LocalFileAccess {
+        guard let current = records.first(where: { $0.id == record.id }), current.status == "completed",
+              let name = current.localName else { throw LANError(message: "文件已被删除或不再可用。") }
+        let folder: URL
+        if let bookmark = current.directoryBookmark {
+            var stale = false
+            folder = try URL(resolvingBookmarkData: bookmark, options: .withoutUI, relativeTo: nil, bookmarkDataIsStale: &stale)
+            if stale {
+                let scoped = folder.startAccessingSecurityScopedResource()
+                defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
+                let refreshed = try folder.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
+                if let i = records.firstIndex(where: { $0.id == record.id }) { records[i].directoryBookmark = refreshed; persist() }
+            }
+        } else { folder = documentURL }
+        return try LocalFileAccess(folder: folder, name: name)
+    }
+
+    func renameFile(_ record: DownloadRecord, to name: String) {
+        performFileOperation(record) { access in
+            let destination = try LocalFileOperations.rename(access.url, to: name)
+            return FileChange(name: destination.lastPathComponent, bookmark: record.directoryBookmark, deleted: false, message: nil)
+        }
+    }
+
+    func transferFile(_ record: DownloadRecord, to folder: URL, moving: Bool) {
+        // Acquire the picker grant before its delegate callback returns.
+        let destinationAccess = ScopedDirectoryAccess(folder)
+        performFileOperation(record) { access in
+            // Create the bookmark before moving anything; a failed grant leaves the source untouched.
+            let bookmark: Data?
+            if moving { bookmark = try folder.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil) }
+            else { bookmark = nil }
+            let destination = try LocalFileOperations.transfer(access.url, to: destinationAccess.url, moving: moving)
+            if moving {
+                return FileChange(name: destination.lastPathComponent, bookmark: bookmark, deleted: false, message: "已移动到所选文件夹。")
+            }
+            return FileChange(name: nil, bookmark: nil, deleted: false, message: "已复制到所选文件夹，原文件保留。")
+        }
+    }
+
+    func deleteFile(_ record: DownloadRecord) {
+        performFileOperation(record) { access in
+            try LocalFileOperations.delete(access.url)
+            return FileChange(name: nil, bookmark: nil, deleted: true, message: "文件及下载记录已删除。")
+        }
+    }
+
+    private struct FileChange {
+        let name: String?
+        let bookmark: Data?
+        let deleted: Bool
+        let message: String?
+    }
+    private func performFileOperation(_ record: DownloadRecord, operation: @escaping (LocalFileAccess) throws -> FileChange) {
+        guard fileOperationID == nil else { return }
+        do {
+            let access = try accessibleFile(record)
+            fileOperationID = record.id
+            fileQueue.async {
+                let result = Result { try operation(access) }
+                DispatchQueue.main.async {
+                    self.fileOperationID = nil
+                    switch result {
+                    case .success(let change):
+                        if let i = self.records.firstIndex(where: { $0.id == record.id }) {
+                            if change.deleted {
+                                self.records.remove(at: i)
+                            } else if let name = change.name {
+                                self.records[i].name = name
+                                self.records[i].localName = name
+                                self.records[i].directoryBookmark = change.bookmark
+                                self.records[i].error = nil
+                            }
+                            self.persist()
+                        }
+                        if let message = change.message { self.notice = message }
+                    case .failure(let error): self.notice = error.localizedDescription
+                    }
+                }
+            }
+        } catch { notice = error.localizedDescription }
     }
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
@@ -285,5 +365,111 @@ enum FileDestination {
                 throw error
             }
         }
+    }
+}
+
+// Hold a Files-provider directory grant for the entire preview/share/file operation.
+final class ScopedDirectoryAccess {
+    let url: URL
+    private let scoped: Bool
+    init(_ url: URL) { self.url = url; scoped = url.startAccessingSecurityScopedResource() }
+    deinit { if scoped { url.stopAccessingSecurityScopedResource() } }
+}
+final class LocalFileAccess {
+    let directory: ScopedDirectoryAccess
+    let url: URL
+    init(folder: URL, name: String) throws {
+        directory = ScopedDirectoryAccess(folder)
+        let valid = try LocalFileOperations.validatedName(name)
+        url = folder.appendingPathComponent(valid)
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw LANError(message: "文件不存在或不是可操作的普通文件，请在文件 App 中检查。")
+        }
+    }
+}
+
+enum LocalFileOperations {
+    static func validatedName(_ name: String) throws -> String {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              name != ".", name != "..", !name.contains("/"), !name.contains("\\"),
+              !name.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }),
+              name.utf8.count <= 255 else { throw LANError(message: "文件名不能为空，不能包含路径分隔符或控制字符，长度不能超过 255 字节。") }
+        return name
+    }
+    static func rename(_ source: URL, to name: String) throws -> URL {
+        let destination = source.deletingLastPathComponent().appendingPathComponent(try validatedName(name))
+        if source.standardizedFileURL == destination.standardizedFileURL { return source }
+        var coordinationError: NSError?
+        var operationError: Error?
+        NSFileCoordinator().coordinate(writingItemAt: source, options: .forMoving, writingItemAt: destination, options: [], error: &coordinationError) { from, to in
+            do {
+                guard !FileManager.default.fileExists(atPath: to.path) else { throw LANError(message: "已存在同名文件，请换一个名称。") }
+                try FileManager.default.moveItem(at: from, to: to)
+            } catch { operationError = error }
+        }
+        if let error = coordinationError { throw error }
+        if let error = operationError { throw error }
+        return destination
+    }
+    static func delete(_ source: URL) throws {
+        var coordinationError: NSError?
+        var operationError: Error?
+        NSFileCoordinator().coordinate(writingItemAt: source, options: .forDeleting, error: &coordinationError) { url in
+            do { try FileManager.default.removeItem(at: url) } catch { operationError = error }
+        }
+        if let error = coordinationError { throw error }
+        if let error = operationError { throw error }
+    }
+    static func transfer(_ source: URL, to folder: URL, moving: Bool) throws -> URL {
+        guard (try folder.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true else { throw LANError(message: "请选择文件夹。") }
+        if moving && source.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL == folder.resolvingSymlinksInPath().standardizedFileURL {
+            throw LANError(message: "文件已经在这个文件夹中。")
+        }
+        var result: URL?
+        var operationError: Error?
+        var coordinationError: NSError?
+        let transfer: (URL, URL) -> Void = { from, directory in
+            do {
+                let size = ((try FileManager.default.attributesOfItem(atPath: from.path))[.size] as? NSNumber)?.int64Value ?? 0
+                if let available = (try? directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage,
+                   size > available { throw LANError(message: "目标位置可用空间不足。") }
+                let to = try copyWithoutOverwriting(from, to: directory)
+                // A failed copy never removes the source. Providers handle cloud upload separately.
+                let copied = ((try FileManager.default.attributesOfItem(atPath: to.path))[.size] as? NSNumber)?.int64Value
+                guard copied == size else { throw LANError(message: "复制后的大小不一致，原文件保留；请检查目标位置的副本。") }
+                if moving {
+                    do { try FileManager.default.removeItem(at: from) }
+                    catch { throw LANError(message: "副本已保存，但原文件未能移除；记录仍指向原文件。请检查目标文件夹。\n" + error.localizedDescription) }
+                }
+                result = to
+            } catch { operationError = error }
+        }
+        let coordinator = NSFileCoordinator()
+        if moving {
+            coordinator.coordinate(writingItemAt: source, options: .forMoving, writingItemAt: folder, options: [], error: &coordinationError, byAccessor: transfer)
+        } else {
+            coordinator.coordinate(readingItemAt: source, options: [], writingItemAt: folder, options: [], error: &coordinationError, byAccessor: transfer)
+        }
+        if let error = coordinationError { throw error }
+        if let error = operationError { throw error }
+        guard let result else { throw LANError(message: "文件操作未完成，原文件保留。") }
+        return result
+    }
+    private static func copyWithoutOverwriting(_ source: URL, to folder: URL) throws -> URL {
+        let name = source.lastPathComponent
+        let ext = (name as NSString).pathExtension
+        let stem = (name as NSString).deletingPathExtension
+        for number in 0...10000 {
+            let candidate = number == 0 ? name : stem + " (\(number))" + (ext.isEmpty ? "" : "." + ext)
+            let destination = folder.appendingPathComponent(try validatedName(candidate))
+            if FileManager.default.fileExists(atPath: destination.path) { continue }
+            do { try FileManager.default.copyItem(at: source, to: destination); return destination }
+            catch let error as NSError {
+                if error.domain == NSCocoaErrorDomain && error.code == NSFileWriteFileExistsError { continue }
+                throw error
+            }
+        }
+        throw LANError(message: "同名副本过多，请选择其他目标文件夹。")
     }
 }

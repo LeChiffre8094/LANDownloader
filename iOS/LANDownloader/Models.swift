@@ -69,6 +69,8 @@ struct DownloadRecord: Codable, Identifiable {
     var bytes: Int64
     var status: String
     var localName: String?
+    // Optional: older records continue to decode without this key.
+    var directoryBookmark: Data? = nil
     var error: String?
     var progress: Double { size > 0 ? min(1, Double(bytes) / Double(size)) : 0 }
 }

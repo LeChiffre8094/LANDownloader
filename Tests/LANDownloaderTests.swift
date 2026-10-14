@@ -77,6 +77,7 @@ final class LANDownloaderTests: XCTestCase {
         XCTAssertEqual(records[0].id, "folder/a.mp4")
         XCTAssertEqual(records[0].bytes, 5_000_000_000)
         XCTAssertNil(records[0].localName)
+        XCTAssertNil(records[0].directoryBookmark)
     }
     func testServerAddressValidation() throws {
         XCTAssertEqual(try Server.normalizedAddress("192.168.1.2:8080"), "http://192.168.1.2:8080/")
@@ -85,4 +86,75 @@ final class LANDownloaderTests: XCTestCase {
             XCTAssertThrowsError(try Server.normalizedAddress(bad), bad)
         }
     }
+    private func withFileFixture(_ body: (URL, URL) throws -> Void) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let target = root.appendingPathComponent("目标目录", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try body(root, target)
+    }
+    func testRenamePreservesContentAndRejectsCollision() throws {
+        try withFileFixture { root, _ in
+            let source = root.appendingPathComponent("原名.mp4")
+            try Data("original".utf8).write(to: source)
+            let renamed = try LocalFileOperations.rename(source, to: "新名字 #%.mp4")
+            XCTAssertEqual(try Data(contentsOf: renamed), Data("original".utf8))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+            let existing = root.appendingPathComponent("已有.mp4")
+            try Data("keep".utf8).write(to: existing)
+            XCTAssertThrowsError(try LocalFileOperations.rename(renamed, to: existing.lastPathComponent))
+            XCTAssertEqual(try Data(contentsOf: existing), Data("keep".utf8))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: renamed.path))
+        }
+    }
+    func testRenameRejectsPathTraversalAndEmptyNames() throws {
+        for name in ["", "   ", ".", "..", "../other", "sub/file", "sub\\file", "bad\nname"] {
+            XCTAssertThrowsError(try LocalFileOperations.validatedName(name), name)
+        }
+        XCTAssertEqual(try LocalFileOperations.validatedName("中文 #&%+.mkv"), "中文 #&%+.mkv")
+    }
+    func testCopyNumbersCollisionAndKeepsOriginal() throws {
+        try withFileFixture { root, target in
+            let source = root.appendingPathComponent("片段.mkv")
+            try Data("source".utf8).write(to: source)
+            let existing = target.appendingPathComponent("片段.mkv")
+            try Data("keep".utf8).write(to: existing)
+            let copied = try LocalFileOperations.transfer(source, to: target, moving: false)
+            XCTAssertEqual(copied.lastPathComponent, "片段 (1).mkv")
+            XCTAssertEqual(try Data(contentsOf: copied), Data("source".utf8))
+            XCTAssertEqual(try Data(contentsOf: existing), Data("keep".utf8))
+            XCTAssertEqual(try Data(contentsOf: source), Data("source".utf8))
+        }
+    }
+    func testMoveCompletesDestinationBeforeRemovingSource() throws {
+        try withFileFixture { root, target in
+            let source = root.appendingPathComponent("move.mp4")
+            let payload = Data(repeating: 17, count: 10000)
+            try payload.write(to: source)
+            let moved = try LocalFileOperations.transfer(source, to: target, moving: true)
+            XCTAssertEqual(try Data(contentsOf: moved), payload)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+        }
+    }
+    func testInvalidMoveDestinationKeepsSource() throws {
+        try withFileFixture { root, _ in
+            let source = root.appendingPathComponent("stay.mp4")
+            try Data("preserve".utf8).write(to: source)
+            XCTAssertThrowsError(try LocalFileOperations.transfer(source, to: root.appendingPathComponent("missing"), moving: true))
+            XCTAssertThrowsError(try LocalFileOperations.transfer(source, to: root, moving: true))
+            XCTAssertEqual(try Data(contentsOf: source), Data("preserve".utf8))
+        }
+    }
+    func testDeleteOnlyRemovesSelectedFile() throws {
+        try withFileFixture { root, _ in
+            let source = root.appendingPathComponent("remove.mp4")
+            let other = root.appendingPathComponent("keep.mp4")
+            try Data("remove".utf8).write(to: source)
+            try Data("keep".utf8).write(to: other)
+            try LocalFileOperations.delete(source)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+            XCTAssertEqual(try Data(contentsOf: other), Data("keep".utf8))
+        }
+    }
+
 }
