@@ -157,4 +157,40 @@ final class LANDownloaderTests: XCTestCase {
         }
     }
 
+
+    private func queueRecord(_ id: String, _ status: String, host: String = "192.168.1.2") -> DownloadRecord {
+        DownloadRecord(id: id, path: id + ".mp4", name: id + ".mp4", url: "http://" + host + "/" + id + ".mp4", size: 100, bytes: 0, status: status, localName: nil, error: nil)
+    }
+    func testSerialQueueStartsInInsertionOrder() {
+        let records = [queueRecord("a", "queued"), queueRecord("b", "queued")]
+        XCTAssertEqual(SerialDownloadQueue.nextID(records: records, restoring: false, outstanding: false), "a")
+    }
+    func testSerialQueueBlocksUntilActiveOrCancellingTaskEnds() {
+        for status in ["downloading", "pausing", "cancelling"] {
+            let records = [queueRecord("a", status), queueRecord("b", "queued")]
+            XCTAssertNil(SerialDownloadQueue.nextID(records: records, restoring: false, outstanding: false), status)
+        }
+    }
+    func testSerialQueueAdvancesAfterFinishFailureOrPause() {
+        for status in ["completed", "failed", "paused", "cancelled"] {
+            let records = [queueRecord("a", status), queueRecord("b", "queued")]
+            XCTAssertEqual(SerialDownloadQueue.nextID(records: records, restoring: false, outstanding: false), "b", status)
+        }
+    }
+    func testSerialQueueWaitsForRestorationAndRetiredCallbacks() {
+        let records = [queueRecord("a", "queued")]
+        XCTAssertNil(SerialDownloadQueue.nextID(records: records, restoring: true, outstanding: false))
+        XCTAssertNil(SerialDownloadQueue.nextID(records: records, restoring: false, outstanding: true))
+    }
+    func testSerialQueueLimitAppliesAcrossServers() {
+        let records = [queueRecord("a", "downloading"), queueRecord("b", "queued", host: "192.168.1.3")]
+        XCTAssertNil(SerialDownloadQueue.nextID(records: records, restoring: false, outstanding: false))
+        XCTAssertNil(SerialDownloadQueue.nextID(records: [queueRecord("a", "paused")], restoring: false, outstanding: false))
+    }
+    func testQueuedRecordsSurvivePersistence() throws {
+        let original = [queueRecord("a", "queued"), queueRecord("b", "paused")]
+        let restored = try JSONDecoder().decode([DownloadRecord].self, from: JSONEncoder().encode(original))
+        XCTAssertEqual(restored.map { $0.status }, ["queued", "paused"])
+        XCTAssertEqual(SerialDownloadQueue.nextID(records: restored, restoring: false, outstanding: false), "a")
+    }
 }
