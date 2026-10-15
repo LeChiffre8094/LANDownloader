@@ -42,7 +42,8 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         config.isDiscretionary = false
         config.allowsCellularAccess = false
         config.waitsForConnectivity = true
-        config.httpMaximumConnectionsPerHost = 1 // Additional guard; scheduler is global across servers.
+        config.httpMaximumConnectionsPerHost = 1
+        config.httpShouldUsePipelining = false // Plain HTTP Caddy uses one request at a time on this connection.
         // Serial main delegate queue keeps task state and UI mutations in one ordering.
         session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
         restoreTasks()
@@ -80,10 +81,13 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
                     self.tasks[id] = download
                     if ["paused", "pausing"].contains(self.records[i].status) {
                         self.records[i].status = "paused"
-                    } else { self.records[i].status = "queued" }
-                    if task.state == .running { task.suspend() }
+                        if task.state == .running { task.suspend() }
+                    } else {
+                        self.records[i].status = "scheduled"
+                        if task.state == .suspended { self.persist(); self.resumeAfterPersist(download, id: id) }
+                    }
                 }
-                for i in self.records.indices where ["downloading", "pausing", "cancelling"].contains(self.records[i].status) && self.tasks[self.records[i].id] == nil {
+                for i in self.records.indices where ["scheduled", "downloading", "pausing", "cancelling"].contains(self.records[i].status) && self.tasks[self.records[i].id] == nil {
                     switch self.records[i].status {
                     case "cancelling": self.records[i].status = "cancelled"
                     case "pausing": self.records[i].status = "paused"
@@ -97,30 +101,22 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         }
     }
     private func startNextIfPossible() {
-        let outstanding = !retiringTasks.isEmpty || tasks.values.contains { $0.state != .suspended }
-        while let id = SerialDownloadQueue.nextID(records: records, restoring: restoring, outstanding: outstanding) {
-            guard let i = records.firstIndex(where: { $0.id == id }) else { return }
-            let record = records[i]
-            let canResume = tasks[id] != nil || FileManager.default.fileExists(atPath: resumeURL(id).path)
-            guard checkCapacity(additional: max(0, record.size - (canResume ? record.bytes : 0)), excluding: id, includeQueued: false) else {
-                records[i].status = "failed"
-                records[i].error = notice ?? "可用空间不足"
-                if let oldTask = tasks.removeValue(forKey: id) { retire(oldTask); persist(); return }
-                persist()
-                continue
-            }
+        // Submit the whole server batch while awake. Background completion callbacks
+        // must not be required to launch each subsequent file in that batch.
+        let ids = SerialDownloadQueue.batchIDs(records: records, restoring: restoring, outstanding: !retiringTasks.isEmpty)
+        for id in ids {
+            guard let i = records.firstIndex(where: { $0.id == id }) else { continue }
             if let task = tasks[id] {
-                records[i].status = "downloading"
+                records[i].status = "scheduled"
                 records[i].error = nil
                 persist()
                 resumeAfterPersist(task, id: id)
-            } else { start(record, resume: true) }
-            return
+            } else { start(records[i], resume: true) }
         }
     }
     private func resumeAfterPersist(_ task: URLSessionDownloadTask, id: String) {
         storeQueue.async { DispatchQueue.main.async {
-            if self.tasks[id]?.taskIdentifier == task.taskIdentifier && self.records.first(where: { $0.id == id })?.status == "downloading" { task.resume() }
+            if self.tasks[id]?.taskIdentifier == task.taskIdentifier && ["scheduled", "downloading"].contains(self.records.first(where: { $0.id == id })?.status ?? "") { task.resume() }
         } }
     }
     private func availableBytes() -> Int64? {
@@ -137,7 +133,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         guard let available = availableBytes() else {
             notice = "无法读取设备可用空间，请稍后重试。"; return false
         }
-        let remaining = records.filter { ($0.status == "downloading" || (includeQueued && $0.status == "queued")) && $0.id != id }.reduce(reserve) {
+        let remaining = records.filter { (["scheduled", "downloading"].contains($0.status) || (includeQueued && $0.status == "queued")) && $0.id != id }.reduce(reserve) {
             saturatedAdd($0, $1.size > 0 ? max(0, $1.size - $1.bytes) : 0)
         }
         guard saturatedAdd(remaining, additional) <= available else {
@@ -153,8 +149,8 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         var seen = Set<String>()
         for file in eligible {
             guard seen.insert(file.url).inserted,
-                  let url = URL(string: file.url), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-                  !records.contains(where: { $0.url == file.url && ["queued", "downloading", "pausing", "paused", "cancelling", "completed"].contains($0.status) }) else { continue }
+                  SerialDownloadQueue.origin(file.url) != nil,
+                  !records.contains(where: { $0.url == file.url && ["queued", "scheduled", "downloading", "pausing", "paused", "cancelling", "completed"].contains($0.status) }) else { continue }
             accepted.append(file)
         }
         let bytes = accepted.reduce(Int64(0)) { saturatedAdd($0, $1.size) }
@@ -181,7 +177,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
             task = session.downloadTask(with: url)
             records[i].bytes = 0
         }
-        records[i].status = "downloading"
+        records[i].status = "scheduled"
         records[i].error = nil
         task.taskDescription = record.id
         tasks[record.id] = task
@@ -207,7 +203,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     func pause(_ record: DownloadRecord) {
         guard !restoring, let i = records.firstIndex(where: { $0.id == record.id }) else { return }
         if records[i].status == "queued" { records[i].status = "paused"; persist(); startNextIfPossible(); return }
-        guard let task = tasks[record.id], records[i].status == "downloading" else { return }
+        guard let task = tasks[record.id], ["scheduled", "downloading"].contains(records[i].status) else { return }
         records[i].status = "pausing"
         try? FileManager.default.removeItem(at: resumeURL(record.id))
         persist()
@@ -329,8 +325,9 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard let id = downloadTask.taskDescription, let i = records.firstIndex(where: { $0.id == id }),
-              (tasks[id] == nil || tasks[id]?.taskIdentifier == downloadTask.taskIdentifier), records[i].status == "downloading" else { return }
+              (tasks[id] == nil || tasks[id]?.taskIdentifier == downloadTask.taskIdentifier), ["scheduled", "downloading"].contains(records[i].status) else { return }
         tasks[id] = downloadTask
+        records[i].status = "downloading"
         records[i].bytes = totalBytesWritten
         if totalBytesExpectedToWrite > 0 { records[i].size = totalBytesExpectedToWrite }
         if Date().timeIntervalSince(lastPersist) > 3 {
@@ -345,7 +342,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let id = downloadTask.taskDescription, let i = records.firstIndex(where: { $0.id == id }),
               (tasks[id] == nil || tasks[id]?.taskIdentifier == downloadTask.taskIdentifier),
-              ["downloading", "pausing", "queued", "paused"].contains(records[i].status) else { return }
+              ["scheduled", "downloading", "pausing", "queued", "paused"].contains(records[i].status) else { return }
         let response = downloadTask.response as? HTTPURLResponse
         guard let code = response?.statusCode, (200...299).contains(code),
               let source = URL(string: records[i].url), let finalURL = response?.url,
@@ -525,11 +522,20 @@ enum LocalFileOperations {
     }
 }
 
-// Pure policy shared with tests. A pausing/cancelling task still owns the only slot.
+// Keep different origins in separate batches. Within a plain HTTP batch,
+// URLSession's single connection handles progression without waking the app.
 enum SerialDownloadQueue {
-    static func nextID(records: [DownloadRecord], restoring: Bool, outstanding: Bool) -> String? {
+    static func origin(_ raw: String) -> String? {
+        guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), let host = url.host?.lowercased() else { return nil }
+        return "\(scheme)://\(host):\(url.port ?? (scheme == "https" ? 443 : 80))"
+    }
+    static func batchIDs(records: [DownloadRecord], restoring: Bool, outstanding: Bool) -> [String] {
         guard !restoring, !outstanding,
-              !records.contains(where: { ["downloading", "pausing", "cancelling"].contains($0.status) }) else { return nil }
-        return records.first(where: { $0.status == "queued" })?.id
+              !records.contains(where: { ["pausing", "cancelling"].contains($0.status) }) else { return [] }
+        let active = records.first { ["scheduled", "downloading"].contains($0.status) }
+        let first = active ?? records.first { $0.status == "queued" }
+        guard let first, let selected = origin(first.url) else { return [] }
+        return records.filter { $0.status == "queued" && origin($0.url) == selected }.map { $0.id }
     }
 }

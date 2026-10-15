@@ -266,8 +266,8 @@ struct DownloadsView: View {
     private var shown: [DownloadRecord] {
         if completed { return Array(manager.records.filter { $0.status == "completed" }.reversed()) }
         let active = manager.records.filter { ["downloading", "pausing", "cancelling"].contains($0.status) }
-        let queued = manager.records.filter { $0.status == "queued" }
-        let other = manager.records.filter { !["completed", "downloading", "pausing", "cancelling", "queued"].contains($0.status) }
+        let queued = manager.records.filter { ["queued", "scheduled"].contains($0.status) }
+        let other = manager.records.filter { !["completed", "downloading", "pausing", "cancelling", "queued", "scheduled"].contains($0.status) }
         return active + queued + other
     }
     var body: some View {
@@ -362,7 +362,7 @@ struct DownloadsView: View {
                     else if record.status == "downloading" { ProgressView() }
                     Text(status(record.status)).font(.caption).foregroundStyle(.secondary)
                 }
-                if ["downloading", "queued"].contains(record.status) {
+                if ["downloading", "queued", "scheduled"].contains(record.status) {
                     Button { manager.pause(record) } label: { Image(systemName: "pause.circle.fill").font(.title2) }.buttonStyle(.borderless).accessibilityLabel("暂停下载")
                 } else if record.status == "paused" {
                     Button { manager.retry(record) } label: { Image(systemName: "play.circle.fill").font(.title2) }.buttonStyle(.borderless).accessibilityLabel("继续下载")
@@ -373,7 +373,7 @@ struct DownloadsView: View {
                 if ["failed", "interrupted", "cancelled"].contains(record.status) { Button("重试") { manager.retry(record) }.buttonStyle(.bordered) }
                 Spacer()
                 Menu {
-                    if ["downloading", "queued", "paused"].contains(record.status) { Button("取消下载", role: .destructive) { manager.cancel(record) } }
+                    if ["downloading", "queued", "scheduled", "paused"].contains(record.status) { Button("取消下载", role: .destructive) { manager.cancel(record) } }
                     if ["paused", "failed", "interrupted", "cancelled"].contains(record.status) { Button("从头下载") { manager.retry(record, fromBeginning: true) } }
                     if !["downloading", "pausing", "cancelling"].contains(record.status) { Button("删除记录", role: .destructive) { manager.remove(record) } }
                 } label: { Image(systemName: "ellipsis").font(.title3).frame(width: 48, height: 48) }
@@ -408,7 +408,7 @@ struct DownloadsView: View {
         }
     }
     private func status(_ status: String) -> String {
-        ["queued": "排队中 · 前一文件结束后开始", "downloading": "下载中 · 逐个传输", "failed": "下载失败", "interrupted": "已中断", "paused": "已暂停", "pausing": "正在暂停…", "cancelling": "正在取消…", "cancelled": "已取消"][status] ?? status
+        ["queued": "等待服务器批次", "scheduled": "系统排队中 · 已提交后台", "downloading": "下载中", "failed": "下载失败", "interrupted": "已中断", "paused": "已暂停", "pausing": "正在暂停…", "cancelling": "正在取消…", "cancelled": "已取消"][status] ?? status
     }
 }
 
