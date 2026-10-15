@@ -15,6 +15,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     private var backgroundCompletion: (() -> Void)?
     private let storeQueue = DispatchQueue(label: "LANDownloader.store")
     private var tasks: [String: URLSessionDownloadTask] = [:]
+    private var retiringTasks = Set<Int>()
     private var lastPersist = Date.distantPast
     private let reserve: Int64 = 200 * 1024 * 1024
     private var supportURL: URL { FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0] }
@@ -41,6 +42,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         config.isDiscretionary = false
         config.allowsCellularAccess = false
         config.waitsForConnectivity = true
+        config.httpMaximumConnectionsPerHost = 1 // Additional guard; scheduler is global across servers.
         // Serial main delegate queue keeps task state and UI mutations in one ordering.
         session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
         restoreTasks()
@@ -58,33 +60,68 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
             } catch { DispatchQueue.main.async { self.notice = "任务记录保存失败：\(error.localizedDescription)" } }
         }
     }
+    private func retire(_ task: URLSessionTask) {
+        guard task.state != .completed else { return }
+        retiringTasks.insert(task.taskIdentifier)
+        task.cancel()
+    }
     private func restoreTasks() {
         session.getAllTasks { existing in
             DispatchQueue.main.async {
                 for task in existing {
                     guard let download = task as? URLSessionDownloadTask, let id = task.taskDescription,
-                          let i = self.records.firstIndex(where: { $0.id == id }) else { task.cancel(); continue }
+                          let i = self.records.firstIndex(where: { $0.id == id }) else { self.retire(task); continue }
                     if ["completed", "cancelled", "cancelling", "failed"].contains(self.records[i].status) {
                         if self.records[i].status == "cancelling" { self.records[i].status = "cancelled" }
-                        task.cancel(); continue
+                        self.retire(task); continue
                     }
+                    // A duplicate system task must never create a second active transfer.
+                    if self.tasks[id] != nil { self.retire(task); continue }
                     self.tasks[id] = download
-                    if self.records[i].status == "paused" {
-                        task.suspend()
-                    } else {
-                        self.records[i].status = "downloading"
-                        task.resume()
-                    }
+                    if ["paused", "pausing"].contains(self.records[i].status) {
+                        self.records[i].status = "paused"
+                    } else { self.records[i].status = "queued" }
+                    if task.state == .running { task.suspend() }
                 }
                 for i in self.records.indices where ["downloading", "pausing", "cancelling"].contains(self.records[i].status) && self.tasks[self.records[i].id] == nil {
-                    let id = self.records[i].id
-                    if self.records[i].status == "cancelling" { self.records[i].status = "cancelled"; continue }
-                    self.records[i].status = FileManager.default.fileExists(atPath: self.resumeURL(id).path) ? "paused" : "interrupted"
+                    switch self.records[i].status {
+                    case "cancelling": self.records[i].status = "cancelled"
+                    case "pausing": self.records[i].status = "paused"
+                    default: self.records[i].status = "queued"
+                    }
                 }
                 self.restoring = false
                 self.persist()
+                self.startNextIfPossible()
             }
         }
+    }
+    private func startNextIfPossible() {
+        let outstanding = !retiringTasks.isEmpty || tasks.values.contains { $0.state != .suspended }
+        while let id = SerialDownloadQueue.nextID(records: records, restoring: restoring, outstanding: outstanding) {
+            guard let i = records.firstIndex(where: { $0.id == id }) else { return }
+            let record = records[i]
+            let canResume = tasks[id] != nil || FileManager.default.fileExists(atPath: resumeURL(id).path)
+            guard checkCapacity(additional: max(0, record.size - (canResume ? record.bytes : 0)), excluding: id, includeQueued: false) else {
+                records[i].status = "failed"
+                records[i].error = notice ?? "可用空间不足"
+                if let oldTask = tasks.removeValue(forKey: id) { retire(oldTask); persist(); return }
+                persist()
+                continue
+            }
+            if let task = tasks[id] {
+                records[i].status = "downloading"
+                records[i].error = nil
+                persist()
+                resumeAfterPersist(task, id: id)
+            } else { start(record, resume: true) }
+            return
+        }
+    }
+    private func resumeAfterPersist(_ task: URLSessionDownloadTask, id: String) {
+        storeQueue.async { DispatchQueue.main.async {
+            if self.tasks[id]?.taskIdentifier == task.taskIdentifier && self.records.first(where: { $0.id == id })?.status == "downloading" { task.resume() }
+        } }
     }
     private func availableBytes() -> Int64? {
         if let values = try? documentURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
@@ -96,11 +133,11 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         let result = a.addingReportingOverflow(max(0, b))
         return result.overflow ? Int64.max : result.partialValue
     }
-    private func checkCapacity(additional: Int64, excluding id: String? = nil) -> Bool {
+    private func checkCapacity(additional: Int64, excluding id: String? = nil, includeQueued: Bool = true) -> Bool {
         guard let available = availableBytes() else {
             notice = "无法读取设备可用空间，请稍后重试。"; return false
         }
-        let remaining = records.filter { $0.status == "downloading" && $0.id != id }.reduce(reserve) {
+        let remaining = records.filter { ($0.status == "downloading" || (includeQueued && $0.status == "queued")) && $0.id != id }.reduce(reserve) {
             saturatedAdd($0, $1.size > 0 ? max(0, $1.size - $1.bytes) : 0)
         }
         guard saturatedAdd(remaining, additional) <= available else {
@@ -117,7 +154,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         for file in eligible {
             guard seen.insert(file.url).inserted,
                   let url = URL(string: file.url), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-                  !records.contains(where: { $0.url == file.url && ["downloading", "pausing", "paused", "cancelling", "completed"].contains($0.status) }) else { continue }
+                  !records.contains(where: { $0.url == file.url && ["queued", "downloading", "pausing", "paused", "cancelling", "completed"].contains($0.status) }) else { continue }
             accepted.append(file)
         }
         let bytes = accepted.reduce(Int64(0)) { saturatedAdd($0, $1.size) }
@@ -125,15 +162,18 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         guard checkCapacity(additional: bytes) else { return 0 }
         for file in accepted {
             let record = DownloadRecord(id: UUID().uuidString, path: file.path, name: file.name,
-                                        url: file.url, size: file.size, bytes: 0, status: "downloading", localName: nil, error: nil)
+                                        url: file.url, size: file.size, bytes: 0, status: "queued", localName: nil, error: nil)
             records.append(record)
-            start(record, resume: false)
         }
         persist()
+        startNextIfPossible()
         return accepted.count
     }
     private func start(_ record: DownloadRecord, resume: Bool) {
-        guard let url = URL(string: record.url), let i = records.firstIndex(where: { $0.id == record.id }) else { return }
+        guard let i = records.firstIndex(where: { $0.id == record.id }) else { return }
+        guard let url = URL(string: record.url), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+            records[i].status = "failed"; records[i].error = "无效下载地址"; persist(); startNextIfPossible(); return
+        }
         let task: URLSessionDownloadTask
         if resume, let data = try? Data(contentsOf: resumeURL(record.id)) {
             task = session.downloadTask(withResumeData: data)
@@ -146,10 +186,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         task.taskDescription = record.id
         tasks[record.id] = task
         persist()
-        // Persist record before the OS starts work, so relaunch can reconcile it.
-        storeQueue.async { DispatchQueue.main.async {
-            if self.tasks[record.id]?.taskIdentifier == task.taskIdentifier && self.records.first(where: { $0.id == record.id })?.status == "downloading" { task.resume() }
-        } }
+        resumeAfterPersist(task, id: record.id)
     }
     func retry(_ record: DownloadRecord, fromBeginning: Bool = false) {
         guard !restoring, let i = records.firstIndex(where: { $0.id == record.id }),
@@ -157,19 +194,24 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         let current = records[i]
         let canResume = !fromBeginning && (tasks[record.id] != nil || FileManager.default.fileExists(atPath: resumeURL(record.id).path))
         guard checkCapacity(additional: max(0, current.size - (canResume ? current.bytes : 0)), excluding: record.id) else { return }
-        if let task = tasks[record.id], current.status == "paused", !fromBeginning {
-            records[i].status = "downloading"; task.resume(); persist(); return
+        if fromBeginning {
+            if let oldTask = tasks.removeValue(forKey: record.id) { retire(oldTask) }
+            try? FileManager.default.removeItem(at: resumeURL(record.id))
+            records[i].bytes = 0
         }
-        if fromBeginning, let oldTask = tasks.removeValue(forKey: record.id) { oldTask.cancel() }
-        guard tasks[record.id] == nil else { return }
-        if fromBeginning { try? FileManager.default.removeItem(at: resumeURL(record.id)) }
-        start(current, resume: !fromBeginning)
+        records[i].status = "queued"
+        records[i].error = nil
+        persist()
+        startNextIfPossible()
     }
     func pause(_ record: DownloadRecord) {
-        guard let task = tasks[record.id], let i = records.firstIndex(where: { $0.id == record.id }), records[i].status == "downloading" else { return }
+        guard !restoring, let i = records.firstIndex(where: { $0.id == record.id }) else { return }
+        if records[i].status == "queued" { records[i].status = "paused"; persist(); startNextIfPossible(); return }
+        guard let task = tasks[record.id], records[i].status == "downloading" else { return }
         records[i].status = "pausing"
         try? FileManager.default.removeItem(at: resumeURL(record.id))
         persist()
+        retiringTasks.insert(task.taskIdentifier)
         task.cancel(byProducingResumeData: { data in
             DispatchQueue.main.async {
                 guard let i = self.records.firstIndex(where: { $0.id == record.id }), self.records[i].status == "pausing" else { return }
@@ -180,6 +222,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
                 self.records[i].status = "paused"
                 if self.tasks[record.id]?.taskIdentifier == task.taskIdentifier { self.tasks.removeValue(forKey: record.id) }
                 self.persist()
+                self.startNextIfPossible()
             }
         })
     }
@@ -187,17 +230,19 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         guard let i = records.firstIndex(where: { $0.id == record.id }), !["pausing", "completed"].contains(records[i].status) else { return }
         records[i].status = tasks[record.id] == nil ? "cancelled" : "cancelling"
         records[i].error = nil
-        tasks[record.id]?.cancel()
+        if let task = tasks[record.id] { retire(task) }
         try? FileManager.default.removeItem(at: resumeURL(record.id))
         persist()
+        startNextIfPossible()
     }
     func remove(_ record: DownloadRecord) {
         guard fileOperationID != record.id else { return }
         guard !["downloading", "pausing", "cancelling"].contains(record.status) else { return }
-        tasks.removeValue(forKey: record.id)?.cancel()
+        if let task = tasks.removeValue(forKey: record.id) { retire(task) }
         records.removeAll { $0.id == record.id }
         try? FileManager.default.removeItem(at: resumeURL(record.id))
         persist()
+        startNextIfPossible()
     }
     func accessibleFile(_ record: DownloadRecord) throws -> LocalFileAccess {
         guard let current = records.first(where: { $0.id == record.id }), current.status == "completed",
@@ -290,7 +335,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         if totalBytesExpectedToWrite > 0 { records[i].size = totalBytesExpectedToWrite }
         if Date().timeIntervalSince(lastPersist) > 3 {
             lastPersist = Date()
-            if !checkCapacity(additional: max(0, records[i].size - totalBytesWritten), excluding: id) {
+            if !checkCapacity(additional: max(0, records[i].size - totalBytesWritten), excluding: id, includeQueued: false) {
                 markFailed(id, notice ?? "可用空间不足")
                 downloadTask.cancel()
             }
@@ -300,7 +345,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let id = downloadTask.taskDescription, let i = records.firstIndex(where: { $0.id == id }),
               (tasks[id] == nil || tasks[id]?.taskIdentifier == downloadTask.taskIdentifier),
-              ["downloading", "pausing"].contains(records[i].status) else { return }
+              ["downloading", "pausing", "queued", "paused"].contains(records[i].status) else { return }
         let response = downloadTask.response as? HTTPURLResponse
         guard let code = response?.statusCode, (200...299).contains(code),
               let source = URL(string: records[i].url), let finalURL = response?.url,
@@ -328,13 +373,19 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         records[i].status = "failed"; records[i].error = message; persist()
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        retiringTasks.remove(task.taskIdentifier)
+        defer { startNextIfPossible() }
         guard let id = task.taskDescription, tasks[id]?.taskIdentifier == task.taskIdentifier else { return }
         tasks.removeValue(forKey: id)
         guard let i = records.firstIndex(where: { $0.id == id }) else { return }
         if records[i].status == "cancelling" { records[i].status = "cancelled"; persist(); return }
-        if let error = error as NSError?, !["pausing", "paused", "completed", "cancelled"].contains(records[i].status) {
+        if let error = error as NSError? {
+            if let data = error.userInfo[NSURLSessionDownloadTaskResumeData] as? Data,
+               !["completed", "cancelled"].contains(records[i].status) {
+                try? data.write(to: resumeURL(id), options: .atomic)
+            }
+            if ["pausing", "paused", "completed", "cancelled"].contains(records[i].status) { return }
             if error.code == NSURLErrorCancelled && records[i].status == "failed" { return }
-            if let data = error.userInfo[NSURLSessionDownloadTaskResumeData] as? Data { try? data.write(to: resumeURL(id), options: .atomic) }
             markFailed(id, error.localizedDescription + "。可重试；若续传失败，请选择从头下载。")
         }
     }
@@ -471,5 +522,14 @@ enum LocalFileOperations {
             }
         }
         throw LANError(message: "同名副本过多，请选择其他目标文件夹。")
+    }
+}
+
+// Pure policy shared with tests. A pausing/cancelling task still owns the only slot.
+enum SerialDownloadQueue {
+    static func nextID(records: [DownloadRecord], restoring: Bool, outstanding: Bool) -> String? {
+        guard !restoring, !outstanding,
+              !records.contains(where: { ["downloading", "pausing", "cancelling"].contains($0.status) }) else { return nil }
+        return records.first(where: { $0.status == "queued" })?.id
     }
 }
