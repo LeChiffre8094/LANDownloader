@@ -33,11 +33,11 @@ jobs:
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/LANDownloader.app Payload/
-          zip -qry LANDownloader-v0.2-unsigned.ipa Payload
+          zip -qry LANDownloader-v0.3.0-build3-unsigned.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
-          name: LANDownloader-v0.2-unsigned-IPA
-          path: LANDownloader-v0.2-unsigned.ipa
+          name: LANDownloader-v0.3.0-build3-unsigned-IPA
+          path: LANDownloader-v0.3.0-build3-unsigned.ipa
           retention-days: 14
       - uses: actions/upload-artifact@v4
         if: always()
