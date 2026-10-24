@@ -359,6 +359,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
             let destination = try FileDestination.move(location, to: documentURL, name: safeName)
             records[i].status = "completed"
             records[i].localName = destination.lastPathComponent
+            records[i].name = destination.lastPathComponent
             if let attrs = try? FileManager.default.attributesOfItem(atPath: destination.path), let size = attrs[.size] as? NSNumber {
                 records[i].bytes = size.int64Value
                 records[i].size = size.int64Value
@@ -405,7 +406,7 @@ enum FileDestination {
         let stem = (name as NSString).deletingPathExtension
         var number = 0
         while true {
-            let candidate = number == 0 ? name : stem + " (\(number))" + (ext.isEmpty ? "" : "." + ext)
+            let candidate = number == 0 ? name : stem + "(\(number + 1))" + (ext.isEmpty ? "" : "." + ext)
             let destination = directory.appendingPathComponent(candidate)
             do {
                 try FileManager.default.moveItem(at: source, to: destination)
@@ -512,7 +513,7 @@ enum LocalFileOperations {
         let ext = (name as NSString).pathExtension
         let stem = (name as NSString).deletingPathExtension
         for number in 0...10000 {
-            let candidate = number == 0 ? name : stem + " (\(number))" + (ext.isEmpty ? "" : "." + ext)
+            let candidate = number == 0 ? name : stem + "(\(number + 1))" + (ext.isEmpty ? "" : "." + ext)
             let destination = folder.appendingPathComponent(try validatedName(candidate))
             if FileManager.default.fileExists(atPath: destination.path) { continue }
             do { try FileManager.default.copyItem(at: source, to: destination); return destination }

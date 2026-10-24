@@ -41,8 +41,9 @@ struct FilesView: View {
         for component in path { url.appendPathComponent(component, isDirectory: true) }
         return url
     }
+    private var recursiveSearch: Bool { category != .all && includeSubfolders }
     private var filtered: [VideoFile] {
-        files.filter { ($0.isDirectory || category == .all || $0.category == category) && (search.isEmpty || ($0.name.localizedCaseInsensitiveContains(search) || (includeSubfolders && $0.path.localizedCaseInsensitiveContains(search)))) }
+        files.filter { (category == .all || (!$0.isDirectory && $0.category == category)) && (search.isEmpty || ($0.name.localizedCaseInsensitiveContains(search) || (recursiveSearch && $0.path.localizedCaseInsensitiveContains(search)))) }
     }
     private var selectable: [VideoFile] { filtered.filter { !$0.isDirectory } }
     private var selectedFiles: [VideoFile] { files.filter { selected.contains($0.id) && !$0.isDirectory } }
@@ -73,7 +74,7 @@ struct FilesView: View {
                     }
                     HStack {
                         Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                        TextField(includeSubfolders ? "搜索文件名或子目录" : "搜索当前目录文件名", text: $search).font(.subheadline).autocorrectionDisabled()
+                        TextField(recursiveSearch ? "搜索文件名或子目录" : "搜索当前目录文件名", text: $search).font(.subheadline).autocorrectionDisabled()
                         if !search.isEmpty { Button { search = "" } label: { Image(systemName: "xmark.circle.fill") } }
                     }.padding(10).background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
                     HStack {
@@ -90,7 +91,9 @@ struct FilesView: View {
                         }
                         Button { showFilter = true } label: { Image(systemName: "line.3.horizontal.decrease.circle").font(.title3) }.accessibilityLabel("文件类型筛选")
                     }
-                    Toggle("包含子文件夹中的全部文件", isOn: $includeSubfolders).font(.caption)
+                    if category != .all {
+                        Toggle("同时筛选子文件夹", isOn: $includeSubfolders).font(.caption)
+                    }
                     HStack {
                         if !path.isEmpty { Button { path.removeLast() } label: { Image(systemName: "chevron.left") }.accessibilityLabel("上一级") }
                         Button { path = [] } label: { Image(systemName: "house") }.accessibilityLabel("共享根目录")
@@ -126,7 +129,7 @@ struct FilesView: View {
                                 FileBadge(name: file.name, directory: file.isDirectory)
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text(file.name).font(.subheadline).foregroundStyle(.primary).lineLimit(2)
-                                    if includeSubfolders, let directory {
+                                    if recursiveSearch, let directory {
                                         Text(relativeFolder(file, from: directory)).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
                                     }
                                     HStack {
@@ -143,7 +146,7 @@ struct FilesView: View {
                 .listStyle(.plain)
                 .refreshable { if !loading { await load() } }
                 .overlay {
-                    if loading { ProgressView(includeSubfolders ? "正在汇总子文件夹…" : "正在读取目录…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)) }
+                    if loading { ProgressView(recursiveSearch ? "正在汇总子文件夹…" : "正在读取目录…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)) }
                     else if filtered.isEmpty && error == nil {
                         VStack(spacing: 12) {
                             Image(systemName: servers.selected == nil ? "network" : "folder").font(.largeTitle)
@@ -171,7 +174,7 @@ struct FilesView: View {
             .onChange(of: servers.selected?.address) { _ in path = []; selected = []; files = [] }
             .onChange(of: category) { _ in selected.formIntersection(Set(selectable.map(\.id))) }
             .onChange(of: search) { _ in selected.formIntersection(Set(selectable.map(\.id))) }
-            .task(id: (directory?.absoluteString ?? "") + (includeSubfolders ? "|recursive" : "|single")) { await load() }
+            .task(id: (directory?.absoluteString ?? "") + (recursiveSearch ? "|recursive" : "|single")) { await load() }
         }
     }
     private func relativeFolder(_ file: VideoFile, from directory: URL) -> String {
@@ -187,7 +190,7 @@ struct FilesView: View {
         do {
             let browser = DirectoryBrowser()
             let result: [VideoFile]
-            if includeSubfolders { result = try await browser.loadRecursively(directory: directory, root: root) }
+            if recursiveSearch { result = try await browser.loadRecursively(directory: directory, root: root) }
             else { result = try await browser.load(directory: directory, root: root) }
             guard requestID == token, !Task.isCancelled else { return }
             files = result
@@ -306,7 +309,7 @@ struct DownloadsView: View {
             .sheet(item: $panel, onDismiss: performPendingAction) { item in
                 switch item.kind {
                 case .menu:
-                    CompletedFileMenu(name: item.record.name) { action in
+                    CompletedFileMenu(name: item.record.localName ?? item.record.name) { action in
                         pendingAction = PendingFileAction(record: item.record, action: action)
                         panel = nil
                     } onCancel: { panel = nil }
@@ -348,7 +351,7 @@ struct DownloadsView: View {
                 HStack(spacing: 12) {
                     FileBadge(name: record.name)
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(record.name).font(.subheadline.weight(.medium)).foregroundStyle(.primary).lineLimit(2)
+                        Text(record.localName ?? record.name).font(.subheadline.weight(.medium)).foregroundStyle(.primary).lineLimit(2)
                         Text(sizeString(record.size)).font(.caption).foregroundStyle(.secondary)
                         if let error = record.error { Text(error).font(.caption).foregroundStyle(.secondary) }
                     }
@@ -566,6 +569,10 @@ struct ServersView: View {
                     if let error { Text(error).font(.caption).foregroundStyle(.red) }
                     Button { save() } label: { Text("保存").frame(maxWidth: .infinity).padding(6) }.buttonStyle(.borderedProminent)
                     if editing != nil { Button("取消编辑") { reset() } }
+                }
+                Section("关于") {
+                    LabeledContent("版本", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")
+                    LabeledContent("构建号", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—")
                 }
                 Section("使用提示") {
                     Text("把启动 BAT 放在要共享的目录内，双击启动 Caddy。在这里填写电脑的局域网 IP 和窗口显示的端口。")
