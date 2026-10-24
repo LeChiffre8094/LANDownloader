@@ -43,6 +43,9 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         config.allowsCellularAccess = false
         config.waitsForConnectivity = true
         config.httpMaximumConnectionsPerHost = 1
+        // Server-side queuing can withhold response headers while a large file finishes.
+        config.timeoutIntervalForRequest = 7 * 24 * 60 * 60
+        config.timeoutIntervalForResource = 7 * 24 * 60 * 60
         config.httpShouldUsePipelining = false // Plain HTTP Caddy uses one request at a time on this connection.
         // Serial main delegate queue keeps task state and UI mutations in one ordering.
         session = URLSession(configuration: config, delegate: self, delegateQueue: .main)

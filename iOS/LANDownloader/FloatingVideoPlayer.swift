@@ -6,6 +6,13 @@ import KSPlayer
 enum PlaybackEngine: String, CaseIterable, Identifiable {
     case native = "系统引擎", ffmpeg = "FFmpeg · 硬解优先", software = "FFmpeg · 软件解码"
     var id: String { rawValue }
+    static func initial(for name: String) -> PlaybackEngine {
+        let ext = (name as NSString).pathExtension.lowercased()
+        return ["mp4", "mov", "m4v", "3gp"].contains(ext) ? .native : .ffmpeg
+    }
+    var fallback: PlaybackEngine? {
+        switch self { case .native: return .ffmpeg; case .ffmpeg: return .software; case .software: return nil }
+    }
 }
 
 @MainActor
@@ -21,6 +28,8 @@ final class FloatingVideoSession: NSObject, ObservableObject, KSPlayerLayerDeleg
     @Published private(set) var rate: Float = 1
     @Published var expanded = false
     private var layer: KSPlayerLayer?
+    private var startupTimeout: Task<Void, Never>?
+    private var generation = UUID()
     private var pendingSeek: Double?
     private var stopped = false
     private var mayFallback = true
@@ -30,9 +39,11 @@ final class FloatingVideoSession: NSObject, ObservableObject, KSPlayerLayerDeleg
         self.access = access
         savedIdleTimer = UIApplication.shared.isIdleTimerDisabled
         super.init()
-        configure(.native, at: 0, autoplay: true)
+        configure(PlaybackEngine.initial(for: access.url.lastPathComponent), at: 0, autoplay: true)
     }
     private func configure(_ engine: PlaybackEngine, at time: Double, autoplay: Bool) {
+        startupTimeout?.cancel()
+        generation = UUID()
         layer?.delegate = nil
         layer?.pause()
         layer?.stop()
@@ -59,13 +70,20 @@ final class FloatingVideoSession: NSObject, ObservableObject, KSPlayerLayerDeleg
         newLayer.delegate = self
         surface = newLayer.player.view
         playing = autoplay
+        let token = generation
+        startupTimeout = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: 20_000_000_000) } catch { return }
+            guard let self, !self.stopped, self.generation == token,
+                  self.layer?.player.isReadyToPlay != true else { return }
+            self.handleFailure("打开视频超时。文件可能尚未完整下载，或当前引擎无法解析其编码。")
+        }
         if autoplay { newLayer.play() }
         else { newLayer.prepareToPlay() }
     }
     func select(_ engine: PlaybackEngine) {
         guard !stopped else { return }
         mayFallback = false
-        configure(engine, at: elapsed, autoplay: playing)
+        configure(engine, at: elapsed, autoplay: failure != nil || playing)
     }
     func toggle() {
         guard failure == nil, let layer else { return }
@@ -83,6 +101,8 @@ final class FloatingVideoSession: NSObject, ObservableObject, KSPlayerLayerDeleg
     func close() {
         guard !stopped else { return }
         stopped = true
+        startupTimeout?.cancel()
+        startupTimeout = nil
         layer?.delegate = nil
         layer?.pause()
         layer?.stop()
@@ -95,6 +115,8 @@ final class FloatingVideoSession: NSObject, ObservableObject, KSPlayerLayerDeleg
     func player(layer: KSPlayerLayer, state: KSPlayerState) {
         guard self.layer === layer, !stopped else { return }
         if state == .readyToPlay {
+            startupTimeout?.cancel()
+            startupTimeout = nil
             duration = layer.player.duration.isFinite ? max(0, layer.player.duration) : 0
             if let target = pendingSeek {
                 pendingSeek = nil
@@ -118,14 +140,24 @@ final class FloatingVideoSession: NSObject, ObservableObject, KSPlayerLayerDeleg
         loading = false
         playing = false
         guard let error else { return }
-        if engine == .native && mayFallback {
-            mayFallback = false
-            // Leave the engine callback before destroying its player.
+        handleFailure(error.localizedDescription)
+    }
+    private func handleFailure(_ message: String) {
+        startupTimeout?.cancel()
+        startupTimeout = nil
+        loading = false
+        playing = false
+        let token = generation
+        if mayFallback, let next = engine.fallback {
+            // Do not tear down a player while its delegate callback is executing.
             DispatchQueue.main.async { [weak self] in
-                guard let self, !self.stopped else { return }
-                self.configure(.ffmpeg, at: self.elapsed, autoplay: true)
+                guard let self, !self.stopped, self.generation == token else { return }
+                self.configure(next, at: self.elapsed, autoplay: true)
             }
-        } else { failure = "播放失败，可切换引擎或重试。\n" + error.localizedDescription }
+        } else {
+            layer?.pause()
+            failure = "无法打开视频（\(engine.rawValue)）。可重试、切换引擎，或通过分享交给其他播放器。\n" + message
+        }
     }
     func player(layer: KSPlayerLayer, bufferedCount: Int, consumeTime: TimeInterval) {}
 }

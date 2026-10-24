@@ -116,3 +116,46 @@ final class DirectoryBrowser {
         return try DirectoryParser.parse(data, mime: response.mimeType, directory: finalURL, root: root)
     }
 }
+
+
+extension DirectoryBrowser {
+    // Breadth-first traversal of direct children only. Never execute HTML or follow
+    // a directory outside the selected subtree. An error never looks like a complete scan.
+    func loadRecursively(directory: URL, root: URL,
+                         fetch: ((URL, URL) async throws -> [VideoFile])? = nil) async throws -> [VideoFile] {
+        guard DirectoryParser.isWithinRoot(directory, root: root) else { throw LANError(message: "目录超出共享范围") }
+        var pending: [(URL, Int)] = [(directory, 0)]
+        var cursor = 0
+        var seenDirectories = Set<String>()
+        var seenFiles = Set<String>()
+        var result: [VideoFile] = []
+        while cursor < pending.count {
+            try Task.checkCancellation()
+            let (current, depth) = pending[cursor]; cursor += 1
+            guard seenDirectories.insert(current.standardized.absoluteString).inserted else { continue }
+            guard depth <= 64, seenDirectories.count <= 10000 else {
+                throw LANError(message: "子目录层级或数量过多，汇总已停止；请进入更小的目录读取。")
+            }
+            let entries: [VideoFile]
+            do {
+                if let fetch { entries = try await fetch(current, root) }
+                else { entries = try await load(directory: current, root: root) }
+            } catch is CancellationError { throw CancellationError() }
+            catch { throw LANError(message: "读取子目录失败：\(current.path)\n\(error.localizedDescription)。汇总未完成，请重试或关闭包含子文件夹。") }
+            guard entries.count < 10000 else { throw LANError(message: "目录清单可能被服务器截断：\(current.path)，请拆分目录后重试。") }
+            for entry in entries {
+                try Task.checkCancellation()
+                guard let url = DirectoryParser.childURL(entry.url, directory: current, root: directory) else { continue }
+                if entry.isDirectory {
+                    guard pending.count < 10000 else { throw LANError(message: "子目录数量过多，汇总已停止；请进入更小的目录读取。") }
+                    pending.append((url, depth + 1))
+                }
+                else if seenFiles.insert(entry.id).inserted {
+                    result.append(entry)
+                    guard result.count <= 100000 else { throw LANError(message: "文件超过十万项，请进入更小的目录读取。") }
+                }
+            }
+        }
+        return result.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+    }
+}
