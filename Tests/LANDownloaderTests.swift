@@ -65,7 +65,7 @@ final class LANDownloaderTests: XCTestCase {
             let temp = directory.appendingPathComponent("temp-\(number)")
             try Data("payload-\(number)".utf8).write(to: temp)
             let result = try FileDestination.move(temp, to: directory, name: "中文片段.mkv")
-            XCTAssertEqual(result.lastPathComponent, number == 0 ? "中文片段.mkv" : "中文片段 (\(number)).mkv")
+            XCTAssertEqual(result.lastPathComponent, number == 0 ? "中文片段.mkv" : "中文片段(\(number + 1)).mkv")
         }
         XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("中文片段.mkv"), encoding: .utf8), "payload-0")
     }
@@ -120,7 +120,7 @@ final class LANDownloaderTests: XCTestCase {
             let existing = target.appendingPathComponent("片段.mkv")
             try Data("keep".utf8).write(to: existing)
             let copied = try LocalFileOperations.transfer(source, to: target, moving: false)
-            XCTAssertEqual(copied.lastPathComponent, "片段 (1).mkv")
+            XCTAssertEqual(copied.lastPathComponent, "片段(2).mkv")
             XCTAssertEqual(try Data(contentsOf: copied), Data("source".utf8))
             XCTAssertEqual(try Data(contentsOf: existing), Data("keep".utf8))
             XCTAssertEqual(try Data(contentsOf: source), Data("source".utf8))
@@ -247,5 +247,21 @@ final class LANDownloaderTests: XCTestCase {
         XCTAssertEqual(PlaybackEngine.native.fallback, .ffmpeg)
         XCTAssertEqual(PlaybackEngine.ffmpeg.fallback, .software)
         XCTAssertNil(PlaybackEngine.software.fallback)
+    }
+
+    func testNumberedDownloadSkipsExistingNamesAndPreservesExtension() throws {
+        try withFileFixture { root, _ in
+            for name in ["1.MP4", "1(2).MP4", "1(3).MP4"] {
+                try Data(name.utf8).write(to: root.appendingPathComponent(name))
+            }
+            let source = root.appendingPathComponent("incoming.tmp")
+            try Data("new content".utf8).write(to: source)
+            let result = try FileDestination.move(source, to: root, name: "1.MP4")
+            XCTAssertEqual(result.lastPathComponent, "1(4).MP4")
+            XCTAssertEqual(try Data(contentsOf: result), Data("new content".utf8))
+            for name in ["1.MP4", "1(2).MP4", "1(3).MP4"] {
+                XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(name)), Data(name.utf8))
+            }
+        }
     }
 }
