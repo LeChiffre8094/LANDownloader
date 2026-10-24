@@ -196,4 +196,56 @@ final class LANDownloaderTests: XCTestCase {
         XCTAssertEqual(restored.map { $0.status }, ["scheduled", "paused", "queued"])
         XCTAssertEqual(SerialDownloadQueue.batchIDs(records: restored, restoring: false, outstanding: false), ["c"])
     }
+
+    private func browseEntry(_ url: URL, folder: Bool = false) -> VideoFile {
+        VideoFile(path: url.path, name: url.lastPathComponent, size: folder ? 0 : 10, url: url.absoluteString, isDirectory: folder)
+    }
+    func testRecursiveListingIncludesAllLevelsAndSameNames() async throws {
+        let child = root.appendingPathComponent("3", isDirectory: true)
+        let deep = child.appendingPathComponent("4", isDirectory: true)
+        let result = try await DirectoryBrowser().loadRecursively(directory: root, root: root) { directory, _ in
+            if directory == self.root { return [self.browseEntry(self.root.appendingPathComponent("same.mp4")), self.browseEntry(child, folder: true)] }
+            if directory == child { return [self.browseEntry(child.appendingPathComponent("same.mp4")), self.browseEntry(deep, folder: true)] }
+            return [self.browseEntry(deep.appendingPathComponent("中文 #%.mkv"))]
+        }
+        XCTAssertEqual(result.count, 3)
+        XCTAssertEqual(Set(result.map { $0.id }).count, 3)
+        XCTAssertEqual(result.filter { $0.name == "same.mp4" }.count, 2)
+        XCTAssertFalse(result.contains { $0.isDirectory })
+    }
+    func testRecursiveListingRejectsExternalParentAndDuplicateEntries() async throws {
+        let file = browseEntry(root.appendingPathComponent("ok.mp4"))
+        let result = try await DirectoryBrowser().loadRecursively(directory: root, root: root) { _, _ in
+            [file, file, self.browseEntry(self.root, folder: true), self.browseEntry(URL(string: "http://evil.test/a/")!, folder: true)]
+        }
+        XCTAssertEqual(result.map { $0.name }, ["ok.mp4"])
+    }
+    func testRecursiveFailureDoesNotReturnPartialSuccess() async {
+        do {
+            _ = try await DirectoryBrowser().loadRecursively(directory: root, root: root) { directory, _ in
+                if directory == self.root { return [self.browseEntry(self.root.appendingPathComponent("ok.txt")), self.browseEntry(self.root.appendingPathComponent("bad", isDirectory: true), folder: true)] }
+                throw LANError(message: "fixture failure")
+            }
+            XCTFail("A failed subdirectory must not look like a complete scan")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("汇总未完成")) }
+    }
+    func testRecursiveScanStopsAtDepthLimit() async {
+        do {
+            _ = try await DirectoryBrowser().loadRecursively(directory: root, root: root) { directory, _ in
+                [self.browseEntry(directory.appendingPathComponent("loop", isDirectory: true), folder: true)]
+            }
+            XCTFail("An expanding symlink-like hierarchy must be bounded")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("层级")) }
+    }
+    func testMKVAndNonNativeContainersChooseFFmpeg() {
+        for name in ["movie.MKV", "movie.avi", "movie.ts", "movie.webm", "movie.wmv", "movie.flv"] {
+            XCTAssertEqual(PlaybackEngine.initial(for: name), .ffmpeg)
+        }
+        XCTAssertEqual(PlaybackEngine.initial(for: "movie.MP4"), .native)
+    }
+    func testPlaybackFallbackTerminatesAfterSoftwareAttempt() {
+        XCTAssertEqual(PlaybackEngine.native.fallback, .ffmpeg)
+        XCTAssertEqual(PlaybackEngine.ffmpeg.fallback, .software)
+        XCTAssertNil(PlaybackEngine.software.fallback)
+    }
 }
