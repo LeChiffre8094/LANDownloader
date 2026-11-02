@@ -306,6 +306,15 @@ struct DownloadsView: View {
             }.background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("局域网文件传输").navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if completed && selecting {
+                            Button(selectedIDs == Set(shown.map(\.id)) && !shown.isEmpty ? "取消全选" : "全选") {
+                                let all = Set(shown.map(\.id))
+                                selectedIDs = selectedIDs == all ? [] : all
+                            }
+                        .disabled(shown.isEmpty || manager.fileOperationID != nil)
+                    }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     if completed {
                         Button(selecting ? "取消" : "选择") {
@@ -319,10 +328,6 @@ struct DownloadsView: View {
                 if completed && selecting {
                     VStack(spacing: 12) {
                         HStack {
-                            Button(selectedIDs == Set(shown.map(\.id)) && !shown.isEmpty ? "取消全选" : "全选") {
-                                let all = Set(shown.map(\.id))
-                                selectedIDs = selectedIDs == all ? [] : all
-                            }
                             Spacer()
                             Text("已选择 \(selectedIDs.count) 项").font(.subheadline)
                         }
@@ -428,7 +433,6 @@ struct DownloadsView: View {
                 FileBadge(name: record.name)
                 VStack(alignment: .leading, spacing: 6) {
                     Text(record.name).font(.subheadline.weight(.medium)).lineLimit(2)
-                    Text("\(sizeString(record.bytes)) / \(sizeString(record.size))").font(.caption).foregroundStyle(.secondary)
                     if record.size > 0 { ProgressView(value: record.progress).tint(.blue) }
                     else if record.status == "downloading" { ProgressView() }
                     Text(status(record.status)).font(.caption).foregroundStyle(.secondary)
