@@ -279,6 +279,11 @@ struct DownloadsView: View {
     @State private var renaming: DownloadRecord?
     @State private var newName = ""
     @State private var deletion: PendingFileAction?
+    @State private var selecting = false
+    @State private var selectedIDs = Set<String>()
+    @State private var batchDeleteFiles = false
+    @State private var showingBatchDeletion = false
+    @State private var deletionIDs = Set<String>()
     private var shown: [DownloadRecord] {
         if completed { return Array(manager.records.filter { $0.status == "completed" }.reversed()) }
         let active = manager.records.filter { ["downloading", "pausing", "cancelling"].contains($0.status) }
@@ -300,6 +305,48 @@ struct DownloadsView: View {
                 .overlay { if shown.isEmpty { Text(completed ? "暂无已完成文件" : "暂无下载任务").foregroundStyle(.secondary) } }
             }.background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("局域网文件传输").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if completed {
+                        Button(selecting ? "取消" : "选择") {
+                            video?.close(); video = nil
+                            selecting.toggle(); selectedIDs.removeAll()
+                        }.disabled(manager.fileOperationID != nil)
+                    }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                if completed && selecting {
+                    VStack(spacing: 12) {
+                        HStack {
+                            Button(selectedIDs == Set(shown.map(\.id)) && !shown.isEmpty ? "取消全选" : "全选") {
+                                let all = Set(shown.map(\.id))
+                                selectedIDs = selectedIDs == all ? [] : all
+                            }
+                            Spacer()
+                            Text("已选择 \(selectedIDs.count) 项").font(.subheadline)
+                        }
+                        HStack {
+                            Button("删除文件", role: .destructive) { deletionIDs = selectedIDs; batchDeleteFiles = true; showingBatchDeletion = true }
+                            Spacer()
+                            Button("删除记录", role: .destructive) { deletionIDs = selectedIDs; batchDeleteFiles = false; showingBatchDeletion = true }
+                        }.disabled(selectedIDs.isEmpty)
+                        if manager.fileOperationID != nil { ProgressView("正在处理…") }
+                    }.padding().background(.regularMaterial).disabled(manager.fileOperationID != nil)
+                }
+            }
+            .onChange(of: completed) { _ in selecting = false; selectedIDs.removeAll() }
+            .onChange(of: manager.records.map(\.id)) { ids in selectedIDs.formIntersection(Set(ids)) }
+            .alert(batchDeleteFiles == true ? "删除所选文件？" : "删除所选记录？", isPresented: $showingBatchDeletion) {
+                Button("取消", role: .cancel) { showingBatchDeletion = false }
+                Button("删除", role: .destructive) {
+                    manager.deleteCompleted(ids: deletionIDs, includingFiles: batchDeleteFiles == true)
+                    showingBatchDeletion = false
+                    selectedIDs.removeAll()
+                }
+            } message: {
+                Text(batchDeleteFiles == true ? "将删除所选 \(deletionIDs.count) 个文件及记录；已不存在的文件仅清理记录。无法撤销。" : "仅删除所选 \(deletionIDs.count) 条记录，实际文件保留。")
+            }
             .overlay(alignment: .top) {
                 if let video {
                     FloatingVideoPlayer(session: video) { self.video = nil }
@@ -347,8 +394,16 @@ struct DownloadsView: View {
     }
     private func completedRow(_ record: DownloadRecord) -> some View {
         HStack(spacing: 8) {
-            Button { open(record, kind: .preview) } label: {
+            Button {
+                if selecting {
+                    if !selectedIDs.insert(record.id).inserted { selectedIDs.remove(record.id) }
+                } else { open(record, kind: .preview) }
+            } label: {
                 HStack(spacing: 12) {
+                    if selecting {
+                        Image(systemName: selectedIDs.contains(record.id) ? "checkmark.circle.fill" : "circle")
+                            .font(.title2).foregroundStyle(.blue)
+                    }
                     FileBadge(name: record.name)
                     VStack(alignment: .leading, spacing: 6) {
                         Text(record.localName ?? record.name).font(.subheadline.weight(.medium)).foregroundStyle(.primary).lineLimit(2)
@@ -357,13 +412,13 @@ struct DownloadsView: View {
                     }
                     Spacer(minLength: 0)
                 }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-            }.buttonStyle(.plain).accessibilityHint("预览文件")
-            Button { video?.close(); video = nil; panel = FilePanel(kind: .menu, record: record) } label: {
+            }.buttonStyle(.plain).accessibilityHint(selecting ? "选择或取消选择文件" : "预览文件")
+            if !selecting { Button { video?.close(); video = nil; panel = FilePanel(kind: .menu, record: record) } label: {
                 Image(systemName: "ellipsis").font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(.blue).frame(width: 48, height: 48)
                     .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
                     .contentShape(Rectangle())
-            }.buttonStyle(.borderless).accessibilityLabel("更多操作：\(record.name)")
+            }.buttonStyle(.borderless).accessibilityLabel("更多操作：\(record.name)") }
             if manager.fileOperationID == record.id { ProgressView().accessibilityLabel("正在处理文件") }
         }.padding(.vertical, 8).disabled(manager.fileOperationID != nil)
     }

@@ -16,6 +16,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     private let storeQueue = DispatchQueue(label: "LANDownloader.store")
     private var tasks: [String: URLSessionDownloadTask] = [:]
     private var retiringTasks = Set<Int>()
+    private var lastProgressUpdate: [String: TimeInterval] = [:]
     private var lastPersist = Date.distantPast
     private let reserve: Int64 = 200 * 1024 * 1024
     private var supportURL: URL { FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0] }
@@ -152,12 +153,11 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         var seen = Set<String>()
         for file in eligible {
             guard seen.insert(file.url).inserted,
-                  SerialDownloadQueue.origin(file.url) != nil,
-                  !records.contains(where: { $0.url == file.url && ["queued", "scheduled", "downloading", "pausing", "paused", "cancelling", "completed"].contains($0.status) }) else { continue }
+                  SerialDownloadQueue.origin(file.url) != nil else { continue }
             accepted.append(file)
         }
         let bytes = accepted.reduce(Int64(0)) { saturatedAdd($0, $1.size) }
-        guard !accepted.isEmpty else { notice = "所选文件已有下载任务或已完成，可在下载页查看。"; return 0 }
+        guard !accepted.isEmpty else { notice = "没有可加入下载队列的文件。"; return 0 }
         guard checkCapacity(additional: bytes) else { return 0 }
         for file in accepted {
             let record = DownloadRecord(id: UUID().uuidString, path: file.path, name: file.name,
@@ -235,7 +235,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         startNextIfPossible()
     }
     func remove(_ record: DownloadRecord) {
-        guard fileOperationID != record.id else { return }
+        guard fileOperationID == nil else { return }
         guard !["downloading", "pausing", "cancelling"].contains(record.status) else { return }
         if let task = tasks.removeValue(forKey: record.id) { retire(task) }
         records.removeAll { $0.id == record.id }
@@ -284,9 +284,53 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     }
 
     func deleteFile(_ record: DownloadRecord) {
-        performFileOperation(record) { access in
-            try LocalFileOperations.delete(access.url)
-            return FileChange(name: nil, bookmark: nil, deleted: true, message: "文件及下载记录已删除。")
+        deleteCompleted(ids: [record.id], includingFiles: true)
+    }
+
+    // Snapshot only completed IDs. New completions are never swept into a running batch.
+    func deleteCompleted(ids: Set<String>, includingFiles: Bool) {
+        guard fileOperationID == nil else { return }
+        let selected = records.filter { ids.contains($0.id) && $0.status == "completed" }
+        guard !selected.isEmpty else { return }
+        if !includingFiles {
+            let selectedIDs = Set(selected.map(\.id))
+            records.removeAll { selectedIDs.contains($0.id) }
+            persist()
+            return
+        }
+        fileOperationID = "batch-delete"
+        deleteNextCompleted(selected, index: 0, removed: 0, failures: [])
+    }
+
+    private func deleteNextCompleted(_ selected: [DownloadRecord], index: Int, removed: Int, failures: [String]) {
+        guard index < selected.count else {
+            fileOperationID = nil
+            notice = "已清理 \(removed) 条记录。" + (failures.isEmpty ? "" : "\n以下文件未能删除，已保留记录：\n" + failures.prefix(5).joined(separator: "\n"))
+            return
+        }
+        let record = selected[index]
+        // Resolve grants on the main queue; keep them alive while the file queue works.
+        let access = Result { try accessibleFile(record) }
+        fileQueue.async {
+            let result = Result {
+                try LocalFileOperations.deleteAllowingMissing {
+                    let file = try access.get()
+                    try LocalFileOperations.delete(file.url)
+                }
+            }
+            DispatchQueue.main.async {
+                var nextFailures = failures
+                var nextRemoved = removed
+                switch result {
+                case .success:
+                    self.records.removeAll { $0.id == record.id && $0.status == "completed" }
+                    self.persist()
+                    nextRemoved += 1
+                case .failure(let error):
+                    nextFailures.append(record.name + ": " + error.localizedDescription)
+                }
+                self.deleteNextCompleted(selected, index: index + 1, removed: nextRemoved, failures: nextFailures)
+            }
         }
     }
 
@@ -329,6 +373,11 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard let id = downloadTask.taskDescription, let i = records.firstIndex(where: { $0.id == id }),
               (tasks[id] == nil || tasks[id]?.taskIdentifier == downloadTask.taskIdentifier), ["scheduled", "downloading"].contains(records[i].status) else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if records[i].status == "downloading",
+           now - (lastProgressUpdate[id] ?? 0) < 0.25,
+           totalBytesExpectedToWrite <= 0 || totalBytesWritten < totalBytesExpectedToWrite { return }
+        lastProgressUpdate[id] = now
         tasks[id] = downloadTask
         records[i].status = "downloading"
         records[i].bytes = totalBytesWritten
@@ -378,6 +427,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         defer { startNextIfPossible() }
         guard let id = task.taskDescription, tasks[id]?.taskIdentifier == task.taskIdentifier else { return }
         tasks.removeValue(forKey: id)
+        lastProgressUpdate.removeValue(forKey: id)
         guard let i = records.firstIndex(where: { $0.id == id }) else { return }
         if records[i].status == "cancelling" { records[i].status = "cancelled"; persist(); return }
         if let error = error as NSError? {
@@ -402,18 +452,19 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
 
 enum FileDestination {
     static func move(_ source: URL, to directory: URL, name: String) throws -> URL {
+        _ = try source.resourceValues(forKeys: [.isRegularFileKey])
         let ext = (name as NSString).pathExtension
         let stem = (name as NSString).deletingPathExtension
         var number = 0
         while true {
-            let candidate = number == 0 ? name : stem + "(\(number + 1))" + (ext.isEmpty ? "" : "." + ext)
+            let candidate = number == 0 ? name : stem + "-\(number)" + (ext.isEmpty ? "" : "." + ext)
             let destination = directory.appendingPathComponent(candidate)
             do {
                 try FileManager.default.moveItem(at: source, to: destination)
                 return destination
             } catch {
                 // moveItem never overwrites; another writer may have won the name race.
-                if FileManager.default.fileExists(atPath: destination.path) { number += 1; continue }
+                if (error as NSError).domain == NSCocoaErrorDomain && (error as NSError).code == NSFileWriteFileExistsError { number += 1; continue }
                 throw error
             }
         }
@@ -442,6 +493,17 @@ final class LocalFileAccess {
 }
 
 enum LocalFileOperations {
+    static func deleteAllowingMissing(_ operation: () throws -> Void) throws {
+        do { try operation() }
+        catch let error as NSError {
+            // Absence is success; permission, provider and I/O failures are not.
+            if error.domain == NSCocoaErrorDomain &&
+                [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code) { return }
+            if error.domain == NSPOSIXErrorDomain && error.code == 2 { return }
+            throw error
+        }
+    }
+
     static func validatedName(_ name: String) throws -> String {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               name != ".", name != "..", !name.contains("/"), !name.contains("\\"),
@@ -513,7 +575,7 @@ enum LocalFileOperations {
         let ext = (name as NSString).pathExtension
         let stem = (name as NSString).deletingPathExtension
         for number in 0...10000 {
-            let candidate = number == 0 ? name : stem + "(\(number + 1))" + (ext.isEmpty ? "" : "." + ext)
+            let candidate = number == 0 ? name : stem + "-\(number)" + (ext.isEmpty ? "" : "." + ext)
             let destination = folder.appendingPathComponent(try validatedName(candidate))
             if FileManager.default.fileExists(atPath: destination.path) { continue }
             do { try FileManager.default.copyItem(at: source, to: destination); return destination }

@@ -48,16 +48,47 @@ try {
     Write-Host "共享目录：$shareRoot"
     Write-Host "端口：$portNumber"
     Write-Host '请把以下与手机同网段的地址添加到 App：' -ForegroundColor Green
+    try {
     $addresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -ExpandProperty IPAddress -Unique)
+    } catch { $addresses = @() }
     foreach ($ip in $addresses) { Write-Host ("  http://{0}:{1}" -f $ip, $portNumber) -ForegroundColor Green }
     if ($addresses.Count -eq 0) { Write-Host '未找到 IPv4 地址。请连接 Wi-Fi 或网线后重新启动。' -ForegroundColor Yellow }
     Write-Host ''
     Write-Host '保持本窗口打开；Ctrl+C 停止此目录共享。不要重复双击同一个目录的 BAT。'
     Write-Host '首次防火墙提示请选择允许专用网络。只共享你愿意向同一局域网开放的文件夹。'
-    if ((Test-Path -LiteralPath (Join-Path $shareRoot 'index.html')) -or (Test-Path -LiteralPath (Join-Path $shareRoot 'index.txt'))) {
-        Write-Host '注意：该目录存在 index.html/index.txt，Caddy 可能展示首页而不是清单；请改用不含首页文件的子目录。' -ForegroundColor Yellow
+    # Use a loopback file server and one HTTP/1.1 upstream connection.
+    # This serializes file response bodies at the PC, independent of iOS scheduling.
+    $backendPort = 0
+    foreach ($candidate in 18200..18399) { if (Test-FreePort $candidate) { $backendPort = $candidate; break } }
+    if ($backendPort -eq 0) { throw '没有可用的内部端口（18200–18399）。' }
+    $fileHandler = @{ handler = 'file_server'; root = $shareRoot; browse = @{}; index_names = @(); hide = @('Start-LANDownloader.bat'; 'caddy.exe') }
+    $proxyHandler = @{
+        handler = 'reverse_proxy'
+        upstreams = @(@{ dial = ('127.0.0.1:' + $backendPort) })
+        transport = @{ protocol = 'http'; versions = @('1.1'); max_conns_per_host = 1 }
+        # Use normal buffered writes for bulk files; immediate flushing is unnecessary.
     }
-    & $caddyPath file-server --root $shareRoot --listen (':' + $portNumber) --browse
+    # Directory/metadata requests bypass the transfer queue so browsing stays usable.
+    $browseMatchers = @(@{ path_regexp = @{ pattern = '/$' } }; @{ method = @('HEAD') })
+    $config = @{
+        admin = @{ disabled = $true }
+        apps = @{ http = @{ servers = @{
+            public = @{
+                listen = @((':' + $portNumber))
+                routes = @(
+                    @{ match = $browseMatchers; handle = @($fileHandler); terminal = $true }
+                    @{ handle = @($proxyHandler); terminal = $true }
+                )
+            }
+            files = @{ listen = @(('127.0.0.1:' + $backendPort)); routes = @(@{ handle = @($fileHandler) }) }
+        } } }
+    }
+    $configPath = Join-Path $stateDirectory ($key + '-serial.json')
+    [IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 25), [Text.UTF8Encoding]::new($false))
+    Write-Host '已启用电脑端单文件发送队列；其他文件等待当前文件发送完毕。' -ForegroundColor Cyan
+    & $caddyPath validate --config $configPath
+    if ($LASTEXITCODE -ne 0) { throw 'Caddy 配置验证失败，请将错误信息发给开发者。' }
+    & $caddyPath run --config $configPath
     if ($LASTEXITCODE -ne 0) { throw "Caddy 启动失败（退出码 $LASTEXITCODE），请检查端口和目录。" }
 } catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
