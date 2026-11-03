@@ -12,6 +12,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     @Published private(set) var fileOperationID: String?
     private let fileQueue = DispatchQueue(label: "LANDownloader.fileOperations", qos: .userInitiated)
     private var session: URLSession!
+    private let transferMonitor = TransferMonitor()
     private var backgroundCompletion: (() -> Void)?
     private let storeQueue = DispatchQueue(label: "LANDownloader.store")
     private var tasks: [String: URLSessionDownloadTask] = [:]
@@ -38,6 +39,9 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
                 notice = "旧任务记录无法读取，已尝试备份记录；原文件仍保留在文件 App。"
             }
         }
+        transferMonitor.seed(records)
+        NotificationCenter.default.addObserver(self, selector: #selector(refreshDesktopMonitor),
+            name: UIApplication.didBecomeActiveNotification, object: nil)
         let config = URLSessionConfiguration.background(withIdentifier: "com.lantransfer.downloader.background.v1")
         config.sessionSendsLaunchEvents = true
         config.isDiscretionary = false
@@ -55,7 +59,12 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     func setBackgroundCompletion(_ handler: @escaping () -> Void) {
         DispatchQueue.main.async { self.backgroundCompletion = handler }
     }
+    @objc private func refreshDesktopMonitor() {
+        transferMonitor.update(records)
+        transferMonitor.resend()
+    }
     private func persist() {
+        transferMonitor.update(records)
         let snapshot = records
         let url = stateURL
         storeQueue.async {
@@ -177,7 +186,9 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         if resume, let data = try? Data(contentsOf: resumeURL(record.id)) {
             task = session.downloadTask(withResumeData: data)
         } else {
-            task = session.downloadTask(with: url)
+            var request = URLRequest(url: url)
+            request.setValue(record.id, forHTTPHeaderField: "X-LAN-Task-ID")
+            task = session.downloadTask(with: request)
             records[i].bytes = 0
         }
         records[i].status = "scheduled"
@@ -603,5 +614,113 @@ enum SerialDownloadQueue {
         let first = active ?? records.first { $0.status == "queued" }
         guard let first, let selected = origin(first.url) else { return [] }
         return records.filter { $0.status == "queued" && origin($0.url) == selected }.map { $0.id }
+    }
+}
+
+// Optional desktop display metadata. This session never drives or gates downloads.
+// Failure/unsupported Caddy endpoint is ignored; background transfer remains independent.
+private final class TransferMonitor: NSObject, URLSessionTaskDelegate {
+    private struct Item: Encodable, Equatable {
+        let id: String
+        let path: String
+        let size: Int64
+        var status: String
+        let savedName: String?
+    }
+    private struct Target: Equatable {
+        let endpoint: URL
+        var item: Item
+    }
+    private var tracked = Set<String>()
+    private var latest: [String: Target] = [:]
+    private var acknowledged: [String: Target] = [:]
+    private var attempts: [String: Int] = [:]
+    private var pending: DispatchWorkItem?
+    private var inFlight = false
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 5
+        config.timeoutIntervalForResource = 8
+        config.allowsCellularAccess = false
+        config.httpMaximumConnectionsPerHost = 2
+        return URLSession(configuration: config, delegate: self, delegateQueue: .main)
+    }()
+    func seed(_ records: [DownloadRecord]) {
+        tracked = Set(records.filter { ["queued", "scheduled", "downloading", "paused", "pausing"].contains($0.status) }.map(\.id))
+    }
+    func resend() {
+        acknowledged.removeAll(); attempts.removeAll()
+        schedule(after: 0.25)
+    }
+    func update(_ records: [DownloadRecord]) {
+        var present = Set<String>()
+        var changed = false
+        for record in records {
+            present.insert(record.id)
+            if ["queued", "scheduled", "downloading"].contains(record.status) { tracked.insert(record.id) }
+            guard tracked.contains(record.id), UUID(uuidString: record.id) != nil,
+                  let address = DesktopMonitorAddress.resolve(record.url) else { continue }
+            let path = address.path
+            let endpoint = address.endpoint
+            let state: String
+            switch record.status {
+            case "completed": state = "completed"
+            case "paused", "pausing": state = "paused"
+            case "cancelled", "cancelling": state = "cancelled"
+            case "failed", "interrupted": state = "failed"
+            default: state = "queued"
+            }
+            let target = Target(endpoint: endpoint, item: Item(id: record.id, path: path,
+                size: max(0, record.size), status: state, savedName: state == "completed" ? record.localName : nil))
+            if latest[record.id] != target { latest[record.id] = target; attempts[record.id] = 0; changed = true }
+        }
+        for id in Array(latest.keys) where !present.contains(id) && latest[id]?.item.status == "queued" {
+            latest[id]?.item.status = "cancelled"; attempts[id] = 0; changed = true
+        }
+        if changed { schedule(after: 0.25) }
+    }
+    private func schedule(after delay: Double) {
+        pending?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.flush() }
+        pending = work; DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+    private func flush() {
+        guard !inFlight else { return }
+        let unsent = latest.filter { acknowledged[$0.key] != $0.value && (attempts[$0.key] ?? 0) < 3 }
+        guard let endpoint = unsent.values.first?.endpoint else { return }
+        let batch = Array(unsent.filter { $0.value.endpoint == endpoint }.prefix(128))
+        guard let data = try? JSONEncoder().encode(batch.map { $0.value.item }) else { return }
+        for (id, _) in batch { attempts[id, default: 0] += 1 }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        inFlight = true
+        session.dataTask(with: request) { [weak self] _, response, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.inFlight = false
+                if (response as? HTTPURLResponse)?.statusCode == 204 {
+                    for (id, target) in batch { self.acknowledged[id] = target }
+                }
+                self.schedule(after: 1)
+            }
+        }.resume()
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
+enum DesktopMonitorAddress {
+    static func resolve(_ raw: String) -> (endpoint: URL, path: String)? {
+        guard var components = URLComponents(string: raw), components.host != nil,
+              components.user == nil, components.password == nil,
+              ["http", "https"].contains(components.scheme?.lowercased() ?? "") else { return nil }
+        let path = components.percentEncodedPath
+        components.path = "/.lan-transfer/v1/tasks"
+        components.query = nil; components.fragment = nil
+        guard let endpoint = components.url else { return nil }
+        return (endpoint, path)
     }
 }

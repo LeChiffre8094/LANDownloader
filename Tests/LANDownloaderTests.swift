@@ -2,6 +2,17 @@ import XCTest
 @testable import LANDownloader
 
 final class LANDownloaderTests: XCTestCase {
+    func testDesktopMonitorKeepsOriginAndEncodedPath() {
+        let result = DesktopMonitorAddress.resolve("http://192.168.1.2:8080/sub/a%20%23%25.MP4?token=test#fragment")
+        XCTAssertEqual(result?.endpoint.absoluteString, "http://192.168.1.2:8080/.lan-transfer/v1/tasks")
+        XCTAssertEqual(result?.path, "/sub/a%20%23%25.MP4")
+        XCTAssertEqual(DesktopMonitorAddress.resolve("https://example.test:8443/a.mp4")?.endpoint.host, "example.test")
+    }
+    func testDesktopMonitorRejectsInvalidTargets() {
+        for value in ["file:///tmp/a", "ftp://example.test/a", "/a.mp4", "http://user:pass@example.test/a"] {
+            XCTAssertNil(DesktopMonitorAddress.resolve(value))
+        }
+    }
     let root = URL(string: "http://192.168.1.2:8080/share/")!
     func testAllRequestedVideoExtensions() {
         for ext in "mp4 mkv mov m4v avi ts m2ts webm flv wmv mpg mpeg 3gp".split(separator: " ") {
